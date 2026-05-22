@@ -1,0 +1,33 @@
+name: Daily feedback maintenance
+
+on:
+  schedule:
+    # 09:00 Asia/Shanghai
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      create_empty_report:
+        description: "Create a report issue even when there is no actionable feedback"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  survey:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Survey feedback issues
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FEEDBACK_REPO: 1951779219/novel_video_pipeline_feedback
+          SOURCE_REPO: 1951779219/novel_video_pipeline
+          LOOKBACK_HOURS: "24"
+          CREATE_EMPTY_REPORT: ${{ inputs.create_empty_report || 'false' }}
+        run: python tools/feedback_daily.py
