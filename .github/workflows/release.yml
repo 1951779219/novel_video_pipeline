@@ -1,0 +1,101 @@
+name: Release update package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $line = Get-Content app/version.py | Select-String 'VERSION\s*=\s*[''"]([^''"]+)[''"]' | Select-Object -First 1
+          if (-not $line) { throw "VERSION was not found in app/version.py" }
+          $version = $line.Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "zip_name=novel_video_pipeline_v${version}_update.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Build release notes
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $notesPath = "release_notes.md"
+          if (Test-Path CHANGELOG.md) {
+            $lines = Get-Content CHANGELOG.md
+            $start = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match "^##\s+v?$([regex]::Escape($version))(\s|$)") {
+                $start = $i + 1
+                break
+              }
+            }
+            if ($start -ge 0) {
+              $end = $lines.Count
+              for ($j = $start; $j -lt $lines.Count; $j++) {
+                if ($lines[$j] -match "^##\s+") {
+                  $end = $j
+                  break
+                }
+              }
+              $notes = $lines[$start..($end - 1)] -join "`n"
+              $notes = $notes.Trim()
+              if ($notes) {
+                Set-Content -Path $notesPath -Value $notes -Encoding UTF8
+                exit 0
+              }
+            }
+          }
+          Set-Content -Path $notesPath -Value "Release v$version" -Encoding UTF8
+
+      - name: Build update zip
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "novel_video_update"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          robocopy app (Join-Path $stage "app") /E /XD __pycache__ /NP /NFL /NDL /NJH /NJS
+          if ($LASTEXITCODE -lt 8) { $global:LASTEXITCODE = 0 }
+          foreach ($f in @(
+            "README.md",
+            "requirements.txt",
+            "update.bat",
+            "启动.bat",
+            "桌面GUI.bat"
+          )) {
+            if (Test-Path $f) { Copy-Item $f $stage -Force }
+          }
+          Compress-Archive -Path "$stage\*" -DestinationPath "${{ steps.version.outputs.zip_name }}" -Force
+
+      - name: Build update manifest
+        shell: pwsh
+        run: |
+          $url = "https://github.com/1951779219/novel_video_pipeline_release/releases/download/${{ github.ref_name }}/${{ steps.version.outputs.zip_name }}"
+          $notes = (Get-Content release_notes.md -Raw).Trim()
+          python tools/make_update_manifest.py `
+            --zip "${{ steps.version.outputs.zip_name }}" `
+            --version "${{ steps.version.outputs.version }}" `
+            --url "$url" `
+            --out latest.json `
+            --notes "$notes"
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: 1951779219/novel_video_pipeline_release
+          token: ${{ secrets.RELEASE_REPO_TOKEN }}
+          body_path: release_notes.md
+          files: |
+            ${{ steps.version.outputs.zip_name }}
+            latest.json

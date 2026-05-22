@@ -1,0 +1,2044 @@
+"""Pipeline orchestration.
+
+Stages write durable artifacts into data/jobs/{job_id}.  Re-running the same
+job can reuse existing audio/images, which matters for very long videos.
+"""
+from __future__ import annotations
+
+import json
+import hashlib
+import html
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
+from pathlib import Path
+from typing import Callable, Iterable
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+from app.config import JOBS_DIR, ROOT, config
+from app.concurrency import external_api_slot, ffmpeg_slot, pid_alive
+from app.scrapers.base import BookSearchResult, Novel, NovelChapter
+from app.scrapers.legado import LegadoStaticScraper
+from app.scrapers.qingtian import QingtianAggregateScraper, parse_host_list
+from app.scrapers.syosetu import SyosetuScraper
+from app.stages.stage2_clean import Segment, split_segments
+from app.stages.stage6_compose import build_ass, build_srt, build_video, concat_audios
+from app.stages.stage_pacing import ImagePlan, plan_images
+from app.backends.image import ImageBackend
+from app.backends.llm import LLMBackend
+from app.backends.tts import TTSBackend, _audio_duration
+from app.utils.ffmpeg import ffmpeg_path
+
+
+LogFn = Callable[[str], None]
+ProgFn = Callable[[float], None]
+
+
+def _parallel_limit(config_key: str, default: int, total: int, hard_cap: int = 16) -> int:
+    try:
+        raw = int(config.get(config_key, default) or default)
+    except Exception:
+        raw = default
+    return max(1, min(int(total or 1), hard_cap, raw))
+
+
+def _noop(*_args, **_kwargs):
+    pass
+
+
+def new_job_id(prefix: str = "job") -> str:
+    return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
+
+
+def job_dir_for(job_id: str) -> Path:
+    return JOBS_DIR / job_id
+
+
+def append_log(job_dir: Path, message: str):
+    job_dir.mkdir(parents=True, exist_ok=True)
+    with (job_dir / "log.txt").open("a", encoding="utf-8") as f:
+        f.write(str(message).rstrip() + "\n")
+
+
+def tail_log(job_id: str, lines: int = 240) -> str:
+    path = job_dir_for(job_id) / "log.txt"
+    if not path.exists():
+        return ""
+    data = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    return "\n".join(data[-lines:])
+
+
+def write_status(job_dir: Path, **updates):
+    job_dir.mkdir(parents=True, exist_ok=True)
+    path = job_dir / "status.json"
+    current = {}
+    if path.exists():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            current = {}
+    current.update(updates)
+    current["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_status(job_id: str) -> dict:
+    path = job_dir_for(job_id) / "status.json"
+    if not path.exists():
+        return {"job_id": job_id, "stage": "missing", "progress": 0}
+    try:
+        status = json.loads(path.read_text(encoding="utf-8"))
+        status["worker_alive"] = pid_alive(status.get("worker_pid"))
+        return status
+    except Exception as exc:
+        return {"job_id": job_id, "stage": "broken", "progress": 0, "error": str(exc)}
+
+
+def list_jobs(limit: int = 50) -> list[dict]:
+    rows: list[dict] = []
+    if not JOBS_DIR.exists():
+        return rows
+    for d in sorted([p for p in JOBS_DIR.iterdir() if p.is_dir()], reverse=True):
+        st = load_status(d.name)
+        rows.append(
+            {
+                "job_id": d.name,
+                "stage": st.get("stage", ""),
+                "progress": st.get("progress", 0),
+                "title": st.get("title", ""),
+                "video": st.get("video", ""),
+                "worker_pid": st.get("worker_pid"),
+                "worker_alive": st.get("worker_alive", False),
+                "updated_at": st.get("updated_at", ""),
+            }
+        )
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def is_worker_running(job_id: str) -> bool:
+    return bool(load_status(job_id).get("worker_alive"))
+
+
+def _safe_job_path(job_id: str) -> Path:
+    root = JOBS_DIR.resolve()
+    path = job_dir_for(job_id).resolve()
+    if path == root or root not in path.parents:
+        raise ValueError(f"unsafe job path: {path}")
+    return path
+
+
+def delete_job(job_id: str) -> bool:
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 仍在运行，不能删除")
+    path = _safe_job_path(job_id)
+    if not path.exists():
+        return False
+    shutil.rmtree(path)
+    return True
+
+
+def clear_job_media_cache(job_id: str) -> None:
+    """Clear generated media so rerun will call image/cover/compose stages again."""
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 仍在运行，不能清理缓存")
+    path = _safe_job_path(job_id)
+    if not path.exists():
+        return
+    for name in ("images", "cover", "_clips"):
+        target = path / name
+        if target.exists():
+            shutil.rmtree(target)
+    for name in (
+        "prompts.json",
+        "compose_manifest.json",
+        "final.mp4",
+        "final.tmp.mp4",
+        "audio_full.mp3",
+        "subtitle.ass",
+        "subtitle.srt",
+        "result.json",
+        "upload_result.json",
+    ):
+        (path / name).unlink(missing_ok=True)
+    write_status(path, stage="queued", progress=0.0, video="", youtube_url="", cover="")
+    append_log(path, "media cache cleared: images/cover/final video will regenerate")
+
+
+def start_worker(input_text: str, job_id: str | None = None, resume: bool = False) -> tuple[str, int]:
+    """Start a detached worker process and return (job_id, pid)."""
+    job_id = job_id or new_job_id("pipeline")
+    job_dir = job_dir_for(job_id)
+    if job_dir.exists() and not resume:
+        raise FileExistsError(f"job directory already exists: {job_dir}")
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        sys.executable,
+        "-B",
+        "-m",
+        "app.worker",
+        "--job-id",
+        job_id,
+        "--input",
+        input_text,
+    ]
+    if resume:
+        command.append("--resume")
+
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
+    env.setdefault("no_proxy", "localhost,127.0.0.1,::1")
+
+    kwargs = {}
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if bool(config.worker_detached):
+            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        kwargs["creationflags"] = flags
+    elif bool(config.worker_detached):
+        kwargs["start_new_session"] = True
+
+    worker_log = job_dir / "worker.log"
+    append_log(job_dir, f"dispatch worker: {' '.join(command)}")
+    write_status(job_dir, job_id=job_id, input=input_text, stage="queued", progress=0.0, worker_pid=None)
+    with worker_log.open("a", encoding="utf-8", buffering=1) as log_handle:
+        process = subprocess.Popen(
+            command,
+            cwd=str(ROOT),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            close_fds=False,
+            **kwargs,
+        )
+    write_status(job_dir, job_id=job_id, input=input_text, stage="queued", progress=0.0, worker_pid=process.pid)
+    append_log(job_dir, f"worker pid={process.pid}")
+    return job_id, int(process.pid)
+
+
+def _build_scraper(site: str):
+    if site == "syosetu":
+        return SyosetuScraper()
+    if site in {"qingtian", "fanqie", "aggregate"}:
+        return QingtianAggregateScraper(
+            base_url=config.source_base_url,
+            source=config.source_platform,
+            media=config.source_media,
+            hosts=parse_host_list(config.source_hosts),
+            delay=float(config.source_delay),
+        )
+    if site in {"legado", "legado_static"}:
+        return LegadoStaticScraper(config.legado_source_ref)
+    raise ValueError(f"暂不支持 site={site}")
+
+
+def search_books(
+    keyword: str,
+    site: str | None = None,
+    source: str | None = None,
+    media: str | None = None,
+    limit: int = 20,
+    enrich_latest: bool = False,
+) -> list[BookSearchResult]:
+    site = site or config.scraper_site
+    sc = _build_scraper(site)
+    try:
+        if isinstance(sc, QingtianAggregateScraper):
+            return sc.search(keyword, limit=limit, source=source, media=media, enrich_latest=enrich_latest)
+        if isinstance(sc, LegadoStaticScraper):
+            return sc.search(keyword, limit=limit)
+        raise ValueError(f"{site} 暂不支持关键词搜索，请直接输入 URL/ID")
+    finally:
+        sc.close()
+
+
+def _looks_like_text_source(value: str, site: str) -> bool:
+    text = str(value or "")
+    if site in {"text", "local_text", "manual"}:
+        return True
+    stripped = text.strip()
+    lowered = stripped.lower()
+    if re.match(r"^[a-z][a-z0-9+.-]*://", lowered) or lowered.startswith("data:;base64,"):
+        return False
+    if lowered.startswith(("http:", "https:", "qingtian:", "legado:", "syosetu:")):
+        return False
+    if stripped.startswith("{") and ("book_id" in stripped or "bookid" in stripped):
+        return False
+    if "\n" in text or len(text) > 500:
+        return True
+    try:
+        return Path(text.strip().strip('"')).exists()
+    except OSError:
+        return False
+
+
+def _novel_from_text_source(value: str, max_chars: int = 0) -> Novel:
+    raw = str(value or "")
+    source = raw.strip().strip('"')
+    path: Path | None = None
+    try:
+        candidate = Path(source)
+        if candidate.exists() and candidate.is_file():
+            path = candidate
+    except OSError:
+        path = None
+    if path is not None:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        title = path.stem
+        novel_id = str(path)
+    else:
+        text = raw
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        title = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", first_line[:60]).strip(" .") or "manual_text"
+        novel_id = "manual"
+    if max_chars and max_chars > 0:
+        text = text[: int(max_chars)]
+    text = text.strip()
+    return Novel(
+        site="text",
+        novel_id=novel_id,
+        title=title,
+        author="",
+        description="local text input",
+        chapters=[NovelChapter(index=1, title=title, text=text)] if text else [],
+    )
+
+
+def stage_scrape(
+    url_or_id: str,
+    site: str = "syosetu",
+    max_chars: int = 0,
+    on_log: LogFn = _noop,
+) -> Novel:
+    if _looks_like_text_source(url_or_id, site):
+        novel = _novel_from_text_source(url_or_id, max_chars=max_chars)
+        on_log(f"[1/6] Local text: {novel.title}")
+        on_log(f"  OK title={novel.title} chars={len(novel.full_text)}")
+        if not novel.full_text.strip():
+            raise RuntimeError("local text is empty")
+        return novel
+    on_log(f"[1/6] 抓取 {site}: {url_or_id}")
+    sc = _build_scraper(site)
+    try:
+        if isinstance(sc, QingtianAggregateScraper):
+            novel = sc.fetch(url_or_id, max_chars=max_chars, chapter_limit=int(config.scraper_chapter_limit))
+        else:
+            novel = sc.fetch(url_or_id, max_chars=max_chars)
+    finally:
+        sc.close()
+    on_log(f"  OK 标题: {novel.title}  章节数: {len(novel.chapters)}  字数: {len(novel.full_text)}")
+    if not novel.chapters or not novel.full_text.strip():
+        raise RuntimeError("抓取成功但没有正文内容")
+    return novel
+
+
+def stage_clean(novel: Novel, on_log: LogFn = _noop, job_dir: Path | None = None) -> list[Segment]:
+    on_log("[2/6] 清洗 + 切片")
+    text = _clean_non_story_text(novel.full_text, on_log=on_log, job_dir=job_dir)
+    segs = split_segments(text)
+    on_log(f"  OK 切成 {len(segs)} 段")
+    if not segs:
+        raise RuntimeError("正文切片结果为空")
+    return segs
+
+
+_NON_STORY_PATTERNS = [
+    r"作者(有话说|的话|ps|PS|留言|声明)",
+    r"^(PS|P\.S\.|ps)[:：]",
+    r"请假|断更|补更|更新通知|更新时间|恢复更新",
+    r"上架(感言|通知|说明)|架感言|首订|订阅|求首订",
+    r"求(月票|推荐票|收藏|追读|打赏|订阅|五星|好评|催更)",
+    r"感谢.*?(打赏|月票|推荐票|盟主|白银|黄金|支持)",
+    r"(月票|推荐票|打赏|催更|收藏|追读).{0,12}(加更|名单|感谢|支持)",
+    r"读者群|书友群|QQ群|q群|V群|微信|公众号",
+    r"免责声明|版权声明|本章说|章节感言|章节说明|作品相关",
+    r"人物(设定|介绍|小传)|角色(设定|介绍)|人设|设定集|资料卡",
+]
+_NON_STORY_RE = re.compile("|".join(f"(?:{p})" for p in _NON_STORY_PATTERNS), re.I)
+
+
+def _clean_non_story_text(text: str, on_log: LogFn = _noop, job_dir: Path | None = None) -> str:
+    source = str(text or "")
+    if not bool(config.get("ai_text_clean_enabled", False)):
+        return source
+    paragraphs = _split_clean_paragraphs(source)
+    if not paragraphs:
+        return source
+
+    removed: set[int] = set()
+    for i, para in enumerate(paragraphs):
+        if _looks_non_story_paragraph(para):
+            removed.add(i)
+
+    rule_removed = len(removed)
+    ai_removed: set[int] = set()
+    if config.llm_api_key or config.llm_provider == "ollama":
+        try:
+            ai_removed = _ai_classify_non_story_paragraphs(paragraphs, removed, on_log)
+            removed.update(ai_removed)
+        except Exception as exc:
+            on_log(f"  WARN AI 扫文清理失败，保留规则清理结果: {exc}")
+    else:
+        on_log("  AI 扫文清理已开启，但未配置 LLM API Key；仅使用规则清理")
+
+    cleaned_paragraphs = [p for i, p in enumerate(paragraphs) if i not in removed]
+    cleaned = "\n\n".join(cleaned_paragraphs).strip()
+    if not cleaned:
+        on_log("  WARN 扫文清理结果为空，已回退原文")
+        return source
+
+    report = {
+        "enabled": True,
+        "paragraphs": len(paragraphs),
+        "removed_total": len(removed),
+        "removed_by_rules": rule_removed,
+        "removed_by_ai": len(ai_removed),
+        "removed_indices": sorted(removed)[:1000],
+        "chars_before": len(source),
+        "chars_after": len(cleaned),
+    }
+    if job_dir is not None:
+        _write_json(job_dir / "text_clean_report.json", report)
+        (job_dir / "text_cleaned.txt").write_text(cleaned, encoding="utf-8")
+    on_log(
+        f"  AI扫文清理: 段落 {len(paragraphs)} -> {len(cleaned_paragraphs)}，"
+        f"删除 {len(removed)} 段，字数 {len(source)} -> {len(cleaned)}"
+    )
+    return cleaned
+
+
+def _split_clean_paragraphs(text: str) -> list[str]:
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    raw = re.split(r"\n\s*\n|(?<=。)\s*(?=作者有话说|作者的话|PS[:：]|ps[:：])", normalized)
+    paragraphs = []
+    for para in raw:
+        para = re.sub(r"[ \t]+\n", "\n", para).strip()
+        if para:
+            paragraphs.append(para)
+    return paragraphs
+
+
+def _looks_non_story_paragraph(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return True
+    if len(compact) > 420:
+        return False
+    if _NON_STORY_RE.search(compact):
+        dialogue_marks = compact.count("“") + compact.count("”") + compact.count('"')
+        story_punc = sum(compact.count(ch) for ch in "。！？")
+        return dialogue_marks <= 2 or story_punc <= 4
+    return False
+
+
+def _ai_classify_non_story_paragraphs(paragraphs: list[str], already_removed: set[int], on_log: LogFn) -> set[int]:
+    batch_chars = max(1200, int(config.get("ai_text_clean_batch_chars", 6000) or 6000))
+    llm = LLMBackend(
+        provider=config.llm_provider,
+        base_url=config.llm_base_url,
+        api_key=config.llm_api_key,
+        model=config.llm_model,
+        system_prompt=str(config.get("ai_text_clean_prompt", "") or ""),
+        style_suffix="",
+    )
+    removed: set[int] = set()
+    batch: list[tuple[int, str]] = []
+    size = 0
+
+    def flush(current: list[tuple[int, str]]) -> None:
+        if not current:
+            return
+        request = "请判断以下编号段落中哪些应删除，只返回 JSON。\n\n" + "\n\n".join(
+            f"[{idx}] {para[:1200]}" for idx, para in current
+        )
+        with external_api_slot(action="ai text clean"):
+            reply = llm.storyboard(request)
+        for idx in _parse_remove_indices(reply):
+            if any(idx == item[0] for item in current):
+                removed.add(idx)
+
+    for idx, para in enumerate(paragraphs):
+        if idx in already_removed:
+            continue
+        projected = size + len(para)
+        if batch and projected > batch_chars:
+            flush(batch)
+            on_log(f"  AI扫文批次完成，累计 AI 删除 {len(removed)} 段")
+            batch = []
+            size = 0
+        batch.append((idx, para))
+        size += len(para)
+    flush(batch)
+    return removed
+
+
+def _parse_remove_indices(reply: str) -> set[int]:
+    text = str(reply or "").strip()
+    match = re.search(r"\{.*\}", text, re.S)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            raw = data.get("remove", [])
+            return {int(x) for x in raw if str(x).strip().lstrip("-").isdigit() and int(x) >= 0}
+        except Exception:
+            pass
+    nums = re.findall(r"\d+", text)
+    return {int(x) for x in nums}
+
+
+def _stable_hash(value) -> str:
+    data = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _text_hash(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+
+
+def _file_signature(path: Path) -> dict:
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    return {"size": int(st.st_size), "mtime": round(float(st.st_mtime), 3)}
+
+
+def _read_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _tts_config_hash() -> str:
+    return _stable_hash(
+        {
+            "provider": config.tts_provider,
+            "voice": config.tts_voice,
+            "rate": config.tts_rate,
+            "volume": config.get("tts_volume", 1.0),
+            "model": config.get("tts_model", "tts-1"),
+            "emotion": config.get("tts_emotion", ""),
+            "base_url": config.tts_base_url,
+            "extra": config.tts_extra or {},
+            "api_key_hash": _text_hash(config.tts_api_key or "")[:16],
+        }
+    )
+
+
+def _load_tts_manifest(path: Path) -> dict:
+    data = _read_json(path, {})
+    if not isinstance(data, dict):
+        data = {}
+    if not isinstance(data.get("segments"), list):
+        data["segments"] = []
+    data["schema_version"] = 1
+    return data
+
+
+def _set_tts_manifest_entry(manifest_path: Path, manifest: dict, entry: dict) -> None:
+    segments = manifest.setdefault("segments", [])
+    index = int(entry.get("index", -1))
+    for pos, current in enumerate(segments):
+        if int(current.get("index", -2)) == index:
+            segments[pos] = entry
+            break
+    else:
+        segments.append(entry)
+    segments.sort(key=lambda item: int(item.get("index", 0)))
+    manifest["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _write_json(manifest_path, manifest)
+
+
+def _tts_manifest_entry(manifest: dict, index: int) -> dict | None:
+    for entry in manifest.get("segments") or []:
+        if int(entry.get("index", -1)) == int(index):
+            return entry
+    return None
+
+
+def _tts_cache_matches(entry: dict | None, expected: dict, out: Path) -> bool:
+    if not entry or not out.exists():
+        return False
+    if str(entry.get("status")) not in {"ready", "fallback_silence"}:
+        return False
+    for key in ("text_hash", "config_hash", "provider", "voice", "rate"):
+        if str(entry.get(key, "")) != str(expected.get(key, "")):
+            return False
+    if str(entry.get("volume", "1.0")) != str(expected.get("volume", "1.0")):
+        return False
+    sig = _file_signature(out)
+    if not sig:
+        return False
+    if int(entry.get("file_size") or -1) != sig["size"]:
+        return False
+    try:
+        if abs(float(entry.get("file_mtime") or 0) - float(sig["mtime"])) > 1.0:
+            return False
+    except Exception:
+        return False
+    return float(entry.get("duration") or 0) > 0.05
+
+
+def _ready_tts_entry(index: int, seg: Segment, out: Path, duration: float, expected: dict, status: str = "ready") -> dict:
+    sig = _file_signature(out)
+    return {
+        "index": index,
+        "status": status,
+        "path": str(out),
+        "duration": round(float(duration), 3),
+        "text_hash": expected["text_hash"],
+        "config_hash": expected["config_hash"],
+        "provider": expected["provider"],
+        "voice": expected["voice"],
+        "rate": expected["rate"],
+        "volume": expected.get("volume", 1.0),
+        "chars": len(seg.text),
+        "file_size": sig.get("size", 0),
+        "file_mtime": sig.get("mtime", 0),
+    }
+
+
+def _stage_tts_manifest_impl(
+    segments: list[Segment],
+    job_dir: Path,
+    on_log: LogFn,
+    on_prog: ProgFn,
+) -> tuple[list[Path], list[float]]:
+    workers = _parallel_limit("max_parallel_tts", 2, len(segments), hard_cap=12)
+    on_log(
+        f"[3/6] TTS provider={config.tts_provider} voice={config.tts_voice} "
+        f"volume={config.get('tts_volume', 1.0)} parallel={workers}"
+    )
+
+    def make_tts() -> TTSBackend:
+        return TTSBackend(
+            provider=config.tts_provider,
+            voice=config.tts_voice,
+            rate=config.tts_rate,
+            api_key=config.tts_api_key,
+            base_url=config.tts_base_url,
+            extra={**(config.tts_extra or {}), "emotion": config.tts_emotion, "model": config.get("tts_model", "tts-1")},
+            volume=config.get("tts_volume", 1.0),
+        )
+
+    audio_dir = job_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = audio_dir / "tts_manifest.json"
+    manifest = _load_tts_manifest(manifest_path)
+    manifest_lock = threading.Lock()
+    manifest.update(
+        {
+            "provider": config.tts_provider,
+            "voice": config.tts_voice,
+            "rate": config.tts_rate,
+            "volume": config.get("tts_volume", 1.0),
+            "config_hash": _tts_config_hash(),
+            "total": len(segments),
+            "parallel": workers,
+        }
+    )
+    _write_json(manifest_path, manifest)
+
+    audios: list[Path | None] = [None] * len(segments)
+    durations: list[float] = [0.0] * len(segments)
+    retries = max(1, int(config.tts_retries))
+
+    def set_manifest(entry: dict) -> None:
+        with manifest_lock:
+            _set_tts_manifest_entry(manifest_path, manifest, entry)
+
+    def process_segment(i: int, seg: Segment) -> tuple[int, Path, float]:
+        out = audio_dir / f"seg_{i:05d}.mp3"
+        expected = {
+            "text_hash": _text_hash(seg.text),
+            "config_hash": manifest["config_hash"],
+            "provider": config.tts_provider,
+            "voice": config.tts_voice,
+            "rate": config.tts_rate,
+            "volume": config.get("tts_volume", 1.0),
+        }
+        with manifest_lock:
+            entry = _tts_manifest_entry(manifest, i)
+        d = 0.0
+        if _tts_cache_matches(entry, expected, out):
+            d = float(entry.get("duration") or 0.0)
+        elif out.exists():
+            d = _audio_duration(out)
+            if d > 0.05:
+                set_manifest(_ready_tts_entry(i, seg, out, d, expected))
+
+        if d <= 0.05:
+            tts = make_tts()
+            for attempt in range(1, retries + 1):
+                tmp = out.with_suffix(".tmp.mp3")
+                tmp.unlink(missing_ok=True)
+                try:
+                    set_manifest(
+                        {
+                            **expected,
+                            "index": i,
+                            "status": "running",
+                            "path": str(out),
+                            "attempt": attempt,
+                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        },
+                    )
+                    with external_api_slot(action=f"tts {i + 1}/{len(segments)}"):
+                        d = tts.synth(seg.text, tmp)
+                    if d <= 0.05:
+                        raise RuntimeError("audio duration is zero")
+                    tmp.replace(out)
+                    set_manifest(_ready_tts_entry(i, seg, out, d, expected))
+                    break
+                except Exception as exc:
+                    tmp.unlink(missing_ok=True)
+                    set_manifest(
+                        {
+                            **expected,
+                            "index": i,
+                            "status": "failed",
+                            "path": str(out),
+                            "attempt": attempt,
+                            "error": str(exc),
+                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        },
+                    )
+                    on_log(f"  WARN seg{i} TTS failed {attempt}/{retries}: {exc}")
+                    if attempt < retries:
+                        time.sleep(min(8, attempt * 1.5))
+            if d <= 0.05 and config.tts_fail_silence:
+                d = _estimated_speech_duration(seg.text)
+                _create_silence(out, d)
+                set_manifest(_ready_tts_entry(i, seg, out, d, expected, status="fallback_silence"))
+                on_log(f"  WARN seg{i} used {d:.1f}s silent placeholder")
+            elif d <= 0.05:
+                raise RuntimeError(f"seg{i} TTS failed after retries")
+
+        return i, out, d
+
+    completed = 0
+    if workers == 1:
+        iterator = (process_segment(i, seg) for i, seg in enumerate(segments))
+        for i, out, d in iterator:
+            audios[i] = out
+            durations[i] = d
+            completed += 1
+            if completed % 5 == 0 or completed == len(segments):
+                _write_json(job_dir / "durations.json", durations)
+                on_log(f"  [{completed}/{len(segments)}] total {sum(durations):.1f}s")
+                on_prog(completed / max(1, len(segments)))
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tts") as pool:
+            futures = [pool.submit(process_segment, i, seg) for i, seg in enumerate(segments)]
+            for future in as_completed(futures):
+                i, out, d = future.result()
+                audios[i] = out
+                durations[i] = d
+                completed += 1
+                if completed % 5 == 0 or completed == len(segments):
+                    _write_json(job_dir / "durations.json", durations)
+                    on_log(f"  [{completed}/{len(segments)}] total {sum(durations):.1f}s")
+                    on_prog(completed / max(1, len(segments)))
+
+    final_audios = [p for p in audios if p is not None]
+    if len(final_audios) != len(segments):
+        raise RuntimeError("TTS did not produce all audio segments")
+    on_log(f"  OK {len(final_audios)} audio segments, total {sum(durations):.1f}s")
+    return final_audios, durations
+
+
+def stage_tts(
+    segments: list[Segment],
+    job_dir: Path,
+    on_log: LogFn = _noop,
+    on_prog: ProgFn = _noop,
+) -> tuple[list[Path], list[float]]:
+    return _stage_tts_manifest_impl(segments, job_dir, on_log, on_prog)
+    on_log(f"[3/6] TTS: provider={config.tts_provider} voice={config.tts_voice}")
+    tts = TTSBackend(
+        provider=config.tts_provider,
+        voice=config.tts_voice,
+        rate=config.tts_rate,
+        api_key=config.tts_api_key,
+        base_url=config.tts_base_url,
+        extra=config.tts_extra,
+        volume=config.get("tts_volume", 1.0),
+    )
+    audio_dir = job_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audios: list[Path] = []
+    durations: list[float] = []
+    retries = max(1, int(config.tts_retries))
+
+    for i, seg in enumerate(segments):
+        out = audio_dir / f"seg_{i:05d}.mp3"
+        d = _audio_duration(out) if out.exists() else 0.0
+        if d <= 0.05:
+            for attempt in range(1, retries + 1):
+                tmp = out.with_suffix(".tmp.mp3")
+                tmp.unlink(missing_ok=True)
+                try:
+                    d = tts.synth(seg.text, tmp)
+                    if d <= 0.05:
+                        raise RuntimeError("音频时长为 0")
+                    tmp.replace(out)
+                    break
+                except Exception as exc:
+                    tmp.unlink(missing_ok=True)
+                    on_log(f"  WARN seg{i} TTS 失败 {attempt}/{retries}: {exc}")
+                    if attempt < retries:
+                        time.sleep(min(8, attempt * 1.5))
+            if d <= 0.05 and config.tts_fail_silence:
+                d = _estimated_speech_duration(seg.text)
+                _create_silence(out, d)
+                on_log(f"  WARN seg{i} 已用 {d:.1f}s 静音占位，字幕时间轴保持连续")
+            elif d <= 0.05:
+                raise RuntimeError(f"seg{i} TTS 多次失败")
+
+        audios.append(out)
+        durations.append(d)
+        if (i + 1) % 5 == 0 or i == len(segments) - 1:
+            _write_json(job_dir / "durations.json", durations)
+            on_log(f"  [{i + 1}/{len(segments)}] 累计 {sum(durations):.1f}s")
+            on_prog((i + 1) / max(1, len(segments)))
+    on_log(f"  OK {len(audios)} 段音频，总时长 {sum(durations):.1f}s")
+    return audios, durations
+
+
+def stage_pacing(
+    segments: list[Segment],
+    durations: list[float],
+    on_log: LogFn = _noop,
+) -> list[ImagePlan]:
+    on_log(f"[4/6] 图音配比: mode={config.pacing_mode}")
+    plans = plan_images(
+        segments,
+        durations,
+        mode=config.pacing_mode,
+        seconds_per_image=config.pacing_seconds_per_image,
+        sentences_per_image=config.pacing_sentences_per_image,
+        fixed_count=config.pacing_fixed_count,
+    )
+    avg = sum(p.duration for p in plans) / max(1, len(plans))
+    on_log(f"  OK 需要 {len(plans)} 张图，平均 {avg:.1f}s/张")
+    return plans
+
+
+def stage_storyboard_and_image(
+    plans: list[ImagePlan],
+    job_dir: Path,
+    on_log: LogFn = _noop,
+    on_prog: ProgFn = _noop,
+) -> list[Path]:
+    workers = _parallel_limit("max_parallel_images", 2, len(plans), hard_cap=8)
+    on_log(f"[5/6] 分镜+出图: llm={config.llm_provider} image={config.image_provider} parallel={workers}")
+
+    def make_llm() -> LLMBackend:
+        return LLMBackend(
+            provider=config.llm_provider,
+            base_url=config.llm_base_url,
+            api_key=config.llm_api_key,
+            model=config.llm_model,
+            system_prompt=config.llm_storyboard_prompt,
+            style_suffix=config.llm_image_style_suffix,
+        )
+
+    def make_image_backend(provider: str | None = None) -> ImageBackend:
+        return ImageBackend(
+            provider=provider or config.image_provider,
+            base_url=config.image_base_url,
+            api_key=config.image_api_key,
+            model=config.image_model,
+            steps=config.image_steps,
+            cfg=config.image_cfg,
+            workflow_path=config.image_workflow,
+            timeout_seconds=config.get("image_api_timeout_seconds", 900),
+        )
+
+    img_dir = job_dir / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    prompts_log: list[dict | None] = [None] * len(plans)
+    paths: list[Path | None] = [None] * len(plans)
+    write_lock = threading.Lock()
+
+    def process_image(i: int, plan: ImagePlan) -> tuple[int, Path, str]:
+        out = img_dir / f"img_{i:05d}.png"
+        prompt = _prompt_for_plan(make_llm(), plan, on_log, i)
+        prompts_log[i] = {"index": i, "text": plan.text, "prompt": prompt}
+        if not out.exists() or out.stat().st_size < 100:
+            last_exc: Exception | None = None
+            for attempt in range(1, 3):
+                try:
+                    on_log(
+                        f"  image {i + 1}/{len(plans)} call provider={config.image_provider} "
+                        f"base={config.image_base_url or '-'} model={config.image_model or '-'} "
+                        f"size={config.image_width}x{config.image_height} attempt={attempt}"
+                    )
+                    if config.image_provider == "placeholder":
+                        make_image_backend("placeholder").generate(
+                            prompt,
+                            config.llm_negative_prompt,
+                            out,
+                            width=config.image_width,
+                            height=config.image_height,
+                        )
+                    else:
+                        with external_api_slot(action=f"image {i + 1}/{len(plans)}"):
+                            make_image_backend().generate(
+                                prompt,
+                                config.llm_negative_prompt,
+                                out,
+                                width=config.image_width,
+                                height=config.image_height,
+                            )
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    on_log(f"  WARN 图{i} 生成失败 {attempt}/2: {exc}")
+                    time.sleep(attempt)
+            if not out.exists() or out.stat().st_size < 100:
+                on_log(f"  WARN 图{i} 改用占位图: {last_exc}")
+                make_image_backend("placeholder").generate(
+                    prompt,
+                    "",
+                    out,
+                    width=config.image_width,
+                    height=config.image_height,
+                )
+        else:
+            on_log(f"  image {i + 1}/{len(plans)} reuse cached file: {out}")
+        return i, out, prompt
+
+    completed = 0
+    if workers == 1:
+        iterator = (process_image(i, plan) for i, plan in enumerate(plans))
+        for i, out, prompt in iterator:
+            paths[i] = out
+            completed += 1
+            if completed % 5 == 0 or completed == len(plans):
+                with write_lock:
+                    _write_json(job_dir / "prompts.json", [p for p in prompts_log if p is not None])
+                on_log(f"  [{completed}/{len(plans)}] {prompt[:80]}...")
+                on_prog(completed / max(1, len(plans)))
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image") as pool:
+            futures = [pool.submit(process_image, i, plan) for i, plan in enumerate(plans)]
+            for future in as_completed(futures):
+                i, out, prompt = future.result()
+                paths[i] = out
+                completed += 1
+                if completed % 5 == 0 or completed == len(plans):
+                    with write_lock:
+                        _write_json(job_dir / "prompts.json", [p for p in prompts_log if p is not None])
+                    on_log(f"  [{completed}/{len(plans)}] {prompt[:80]}...")
+                    on_prog(completed / max(1, len(plans)))
+
+    final_paths = [p for p in paths if p is not None]
+    if len(final_paths) != len(plans):
+        raise RuntimeError("Image stage did not produce all images")
+    on_log(f"  OK {len(final_paths)} 张图")
+    return final_paths
+
+
+def _metadata_intro(novel: Novel, limit: int = 700) -> str:
+    desc = re.sub(r"\s+", " ", str(novel.description or "")).strip()
+    if desc and desc.lower() != "local text input":
+        return desc[:limit]
+    text = str(novel.full_text or "")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines and lines[0].strip() == str(novel.title or "").strip():
+        lines = lines[1:]
+    joined = " ".join(lines)
+    joined = re.sub(r"\s+", " ", joined).strip()
+    return joined[:limit]
+
+
+def _clean_short_title(text: str, min_chars: int, max_chars: int) -> str:
+    value = html.unescape(str(text or ""))
+    value = re.sub(r"[《》“”\"'`#【】\[\]（）()]", "", value)
+    value = re.sub(r"(?i)^(短说明标题|标题|short title)[:：]\s*", "", value.strip())
+    value = re.sub(r"\s+", "", value)
+    value = re.sub(r"[，。！？；、,.!?;：:]+$", "", value)
+    if len(value) > max_chars:
+        value = value[:max_chars]
+        value = re.sub(r"[，。！？；、,.!?;：:]+$", "", value)
+    return value[:max_chars]
+
+
+def _fallback_short_title(novel: Novel, intro: str, min_chars: int, max_chars: int) -> str:
+    text = re.sub(r"\s+", "", intro or novel.full_text or novel.title or "")
+    text = re.sub(r"^(简介|内容简介|小说简介|作品简介|书籍简介)[:：]?", "", text)
+    text = re.sub(r"[《》“”\"'`#【】\[\]（）()]", "", text)
+    title = re.sub(r"\s+", "", novel.title or "")
+    if title and text.startswith(title):
+        text = text[len(title):]
+    parts = re.split(r"[。！？!?；;]", text)
+    value = ""
+    for part in parts:
+        part = re.sub(r"[，、,:：]+", "", part.strip())
+        if not part:
+            continue
+        value += part
+        if len(value) >= min_chars:
+            break
+    if not value:
+        value = title or "精彩小说推文剧情解说"
+    if len(value) < min_chars and title and title not in value:
+        value = f"{title}{value}"
+    return _clean_short_title(value, min_chars, max_chars) or (title[:max_chars] if title else "精彩小说推文剧情解说")
+
+
+def stage_metadata(novel: Novel, job_dir: Path, on_log: LogFn = _noop) -> dict:
+    intro = _metadata_intro(novel)
+    min_chars = max(6, int(config.get("short_title_min_chars", 20) or 20))
+    max_chars = max(min_chars, int(config.get("short_title_max_chars", 30) or 30))
+    short_title = ""
+    if bool(config.get("short_title_enabled", True)):
+        if config.llm_api_key or config.llm_provider == "ollama":
+            try:
+                llm = LLMBackend(
+                    provider=config.llm_provider,
+                    base_url=config.llm_base_url,
+                    api_key=config.llm_api_key,
+                    model=config.llm_model,
+                    system_prompt=str(config.get("short_title_prompt", "") or ""),
+                    style_suffix="",
+                )
+                request = f"书名：{novel.title}\n简介：{intro[:900]}\n只输出短说明标题。"
+                with external_api_slot(action="short title"):
+                    short_title = _clean_short_title(llm.storyboard(request), min_chars, max_chars)
+            except Exception as exc:
+                on_log(f"  WARN short title LLM failed: {exc}; use intro fallback")
+        if not short_title:
+            short_title = _fallback_short_title(novel, intro, min_chars, max_chars)
+    metadata = {
+        "title": novel.title,
+        "short_title": short_title,
+        "intro": intro,
+        "author": novel.author,
+        "tags": str(config.youtube_tags or ""),
+    }
+    _write_json(job_dir / "metadata.json", metadata)
+    if short_title:
+        on_log(f"  short_title: {short_title}")
+    return metadata
+
+
+class _SafeFormatDict(dict):
+    def __missing__(self, key):
+        return "{" + str(key) + "}"
+
+
+def _format_template(template: str, context: dict, fallback: str = "") -> str:
+    text = str(template or "")
+    if not text:
+        return fallback
+    try:
+        return text.format_map(_SafeFormatDict({k: "" if v is None else v for k, v in context.items()}))
+    except Exception:
+        return text or fallback
+
+
+def _cover_provider() -> str:
+    provider = str(config.get("cover_provider", "same_as_image") or "").strip()
+    if provider in {"", "same_as_image", "同配图", "同图片"}:
+        return str(config.image_provider or "placeholder")
+    return provider
+
+
+def _cover_backend_settings() -> dict:
+    return {
+        "provider": _cover_provider(),
+        "base_url": str(config.get("cover_base_url", "") or config.image_base_url or ""),
+        "api_key": str(config.get("cover_api_key", "") or config.image_api_key or ""),
+        "model": str(config.get("cover_model", "") or config.image_model or ""),
+    }
+
+
+def _cover_excerpt(novel: Novel, segments: list[Segment], limit: int = 900) -> str:
+    text = novel.full_text or "\n".join(seg.text for seg in segments[:8])
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[: max(80, int(limit))]
+
+
+def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _noop) -> str:
+    title = (novel.title or "Untitled").strip()
+    excerpt = _cover_excerpt(novel, segments)
+    style = str(config.llm_image_style_suffix or "").strip()
+    fallback_template = str(config.get("cover_prompt_template", "") or "")
+    try:
+        fallback = fallback_template.format(title=title, excerpt=excerpt, style=style)
+    except Exception:
+        fallback = (
+            f'Create a cinematic YouTube cover illustration for a novel video. '
+            f'Exact story title context: "{title}". Story excerpt: {excerpt}. '
+            f'Do not render text in the artwork. Leave clean dark lower space for title overlay. {style}'
+        )
+
+    if config.llm_api_key or config.llm_provider == "ollama":
+        try:
+            cover_system = (
+                "You write one concise English image-generation prompt for a long-form novel recap cover. "
+                "Use the title as fixed story context. Do not ask the image model to render any title, words, "
+                "logos, captions, UI, or watermarks. Ask for clean darker visual space at the bottom where "
+                "the video editor will overlay the exact title."
+            )
+            llm = LLMBackend(
+                provider=config.llm_provider,
+                base_url=config.llm_base_url,
+                api_key=config.llm_api_key,
+                model=config.llm_model,
+                system_prompt=cover_system,
+                style_suffix=style,
+            )
+            request = (
+                f'Exact title: "{title}"\n'
+                f"Excerpt: {excerpt}\n\n"
+                "Return one prompt only. The prompt must be based on the excerpt and must keep the exact title "
+                "as story context, but the artwork itself must contain no readable text."
+            )
+            with external_api_slot(action="cover prompt"):
+                prompt = llm.storyboard(request).strip()
+            if title not in prompt:
+                prompt = f'Title context: "{title}". {prompt}'
+            return (
+                f'{prompt}. Do not render any words or title text in the image; '
+                f'leave a clean darker lower band for the overlaid title "{title}".'
+            )
+        except Exception as exc:
+            on_log(f"  WARN cover prompt LLM failed: {exc}; use template prompt")
+    return fallback
+
+
+def _hex_rgb(value: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+    text = str(value or "").strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    if len(text) != 6:
+        return fallback
+    try:
+        return int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16)
+    except ValueError:
+        return fallback
+
+
+def _load_title_font(font_name: str, size: int) -> ImageFont.ImageFont:
+    windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
+    fonts_dir = windir / "Fonts"
+    candidates: list[str | Path] = []
+    name = str(font_name or "").strip()
+    if name:
+        candidates.append(name)
+    if "yahei" in name.lower() or "雅黑" in name:
+        candidates.extend(["msyhbd.ttc", "msyh.ttc"])
+    candidates.extend(
+        [
+            fonts_dir / "msyhbd.ttc",
+            fonts_dir / "msyh.ttc",
+            fonts_dir / "simhei.ttf",
+            fonts_dir / "arialbd.ttf",
+            fonts_dir / "arial.ttf",
+            "msyhbd.ttc",
+            "msyh.ttc",
+            "simhei.ttf",
+            "arialbd.ttf",
+            "arial.ttf",
+        ]
+    )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(str(candidate), size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
+    box = draw.textbbox((0, 0), text, font=font)
+    return int(box[2] - box[0])
+
+
+def _line_height(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
+    box = draw.textbbox((0, 0), text or "Ag", font=font)
+    return int(box[3] - box[1])
+
+
+def _wrap_pixels(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+    lines: list[str] = []
+    for paragraph in [part.strip() for part in str(text or "").splitlines() if part.strip()] or [str(text or "").strip()]:
+        current = ""
+        for ch in paragraph:
+            test = current + ch
+            if not current or _text_width(draw, test, font) <= max_width:
+                current = test
+            else:
+                lines.append(current)
+                current = ch
+        if current:
+            lines.append(current)
+    return lines or [str(text or "").strip()]
+
+
+def _ellipsize(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> str:
+    suffix = "..."
+    text = str(text or "")
+    while text and _text_width(draw, text + suffix, font) > max_width:
+        text = text[:-1]
+    return (text + suffix) if text else suffix
+
+
+def _fit_title(
+    draw: ImageDraw.ImageDraw,
+    title: str,
+    font_name: str,
+    start_size: int,
+    max_width: int,
+    max_height: int,
+) -> tuple[ImageFont.ImageFont, list[str], int]:
+    min_size = 26
+    for size in range(max(min_size, int(start_size)), min_size - 1, -2):
+        font = _load_title_font(font_name, size)
+        lines = _wrap_pixels(draw, title, font, max_width)
+        spacing = max(6, int(size * 0.16))
+        line_h = _line_height(draw, title, font)
+        total_h = len(lines) * line_h + max(0, len(lines) - 1) * spacing
+        if len(lines) <= 2 and total_h <= max_height and all(_text_width(draw, line, font) <= max_width for line in lines):
+            return font, lines, spacing
+
+    font = _load_title_font(font_name, min_size)
+    lines = _wrap_pixels(draw, title, font, max_width)
+    if len(lines) > 2:
+        merged_tail = "".join(lines[1:])
+        lines = [lines[0], _ellipsize(draw, merged_tail, font, max_width)]
+    return font, lines[:2], max(5, int(min_size * 0.16))
+
+
+def _render_cover_title(raw_path: Path, out_path: Path, title: str) -> Path:
+    width = max(320, int(config.get("cover_width", 1280) or 1280))
+    height = max(180, int(config.get("cover_height", 720) or 720))
+    ratio = float(config.get("cover_title_area_ratio", 0.24) or 0.24)
+    band_h = max(110, min(height // 2, int(height * ratio)))
+    img = Image.open(raw_path).convert("RGB")
+    img = ImageOps.fit(img, (width, height), method=Image.LANCZOS, centering=(0.5, 0.45)).convert("RGBA")
+
+    bg = _hex_rgb(str(config.get("cover_title_bg", "#050505")), (5, 5, 5))
+    fg = _hex_rgb(str(config.get("cover_title_color", "#FFFFFF")), (255, 255, 255))
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle((0, height - band_h, width, height), fill=(*bg, 218))
+    img = Image.alpha_composite(img, overlay)
+
+    draw = ImageDraw.Draw(img)
+    title = (title or "Untitled").strip()
+    max_width = int(width * 0.88)
+    max_height = max(60, band_h - 34)
+    font, lines, spacing = _fit_title(
+        draw,
+        title,
+        str(config.get("cover_title_font", "Microsoft YaHei") or "Microsoft YaHei"),
+        int(config.get("cover_title_size", 72) or 72),
+        max_width,
+        max_height,
+    )
+    line_h = _line_height(draw, title, font)
+    total_h = len(lines) * line_h + max(0, len(lines) - 1) * spacing
+    y = height - band_h + (band_h - total_h) / 2
+    shadow = max(2, int(getattr(font, "size", 40) * 0.04))
+    for line in lines:
+        line_w = _text_width(draw, line, font)
+        x = (width - line_w) / 2
+        draw.text((x + shadow, y + shadow), line, fill=(0, 0, 0, 185), font=font)
+        draw.text((x, y), line, fill=(*fg, 255), font=font)
+        y += line_h + spacing
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.convert("RGB").save(out_path, "JPEG", quality=93, optimize=True)
+    return out_path
+
+
+def _create_cover_placeholder(prompt: str, title: str, out_path: Path, width: int, height: int) -> Path:
+    seed = int(_text_hash(f"{title}\n{prompt}")[:12], 16)
+    palettes = [
+        ((18, 24, 34), (94, 132, 148), (222, 189, 96)),
+        ((28, 24, 40), (116, 86, 139), (218, 174, 126)),
+        ((18, 36, 35), (76, 126, 103), (204, 210, 173)),
+        ((38, 28, 26), (138, 76, 61), (231, 173, 91)),
+    ]
+    base, mid, accent = palettes[seed % len(palettes)]
+    img = Image.new("RGB", (width, height), base)
+    px = img.load()
+    for y in range(height):
+        t = y / max(1, height - 1)
+        mix = t * 0.78
+        row = tuple(int(base[i] * (1 - mix) + mid[i] * mix) for i in range(3))
+        for x in range(width):
+            px[x, y] = row
+
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+    shift = seed % max(1, width // 3)
+    d.polygon(
+        [
+            (width * 0.08 + shift // 3, height * 0.20),
+            (width * 0.74, height * 0.06),
+            (width * 0.92, height * 0.62),
+            (width * 0.20, height * 0.78),
+        ],
+        fill=(*accent, 44),
+    )
+    d.polygon(
+        [
+            (-width * 0.08, height * 0.62),
+            (width * 0.42, height * 0.32),
+            (width * 0.70, height * 0.86),
+            (width * 0.06, height * 1.04),
+        ],
+        fill=(255, 255, 255, 20),
+    )
+    d.rectangle((0, int(height * 0.70), width, height), fill=(0, 0, 0, 46))
+    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path, "PNG")
+    return out_path
+
+
+def stage_cover(
+    novel: Novel,
+    segments: list[Segment],
+    job_dir: Path,
+    on_log: LogFn = _noop,
+) -> Path | None:
+    if not bool(config.get("cover_enabled", True)):
+        return None
+
+    title = (novel.title or "Untitled").strip()
+    cover_dir = job_dir / "cover"
+    cover_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = cover_dir / "cover_raw.png"
+    out_path = cover_dir / "cover.jpg"
+    manifest_path = cover_dir / "cover_manifest.json"
+    excerpt = _cover_excerpt(novel, segments)
+    cover_backend = _cover_backend_settings()
+    provider = cover_backend["provider"]
+    expected_hash = _stable_hash(
+        {
+            "schema": "cover_v1",
+            "title": title,
+            "excerpt_hash": _text_hash(excerpt),
+            "provider": provider,
+            "base_url": cover_backend["base_url"],
+            "model": cover_backend["model"],
+            "style": config.llm_image_style_suffix,
+            "prompt_template": config.get("cover_prompt_template", ""),
+            "width": int(config.get("cover_width", 1280) or 1280),
+            "height": int(config.get("cover_height", 720) or 720),
+            "title_size": int(config.get("cover_title_size", 72) or 72),
+            "title_font": config.get("cover_title_font", ""),
+            "title_color": config.get("cover_title_color", ""),
+            "title_bg": config.get("cover_title_bg", ""),
+            "title_area_ratio": float(config.get("cover_title_area_ratio", 0.24) or 0.24),
+            "api_key_hash": _text_hash(cover_backend["api_key"])[:16],
+        }
+    )
+    manifest = _read_json(manifest_path, {})
+    if (
+        isinstance(manifest, dict)
+        and manifest.get("input_hash") == expected_hash
+        and out_path.exists()
+        and out_path.stat().st_size > 1000
+    ):
+        on_log(f"  reuse cover: {out_path}")
+        return out_path
+
+    on_log(f"[cover] Generate cover from title/text: {title}")
+    prompt = _build_cover_prompt(novel, segments, on_log=on_log)
+    (cover_dir / "cover_prompt.txt").write_text(prompt, encoding="utf-8")
+    width = int(config.get("cover_width", 1280) or 1280)
+    height = int(config.get("cover_height", 720) or 720)
+    backend = ImageBackend(
+        provider=provider,
+        base_url=cover_backend["base_url"],
+        api_key=cover_backend["api_key"],
+        model=cover_backend["model"],
+        steps=config.image_steps,
+        cfg=config.image_cfg,
+        workflow_path=config.image_workflow,
+        timeout_seconds=config.get("image_api_timeout_seconds", 900),
+    )
+    raw_tmp = raw_path.with_suffix(".tmp.png")
+    raw_tmp.unlink(missing_ok=True)
+    try:
+        if provider == "placeholder":
+            _create_cover_placeholder(prompt, title, raw_tmp, width, height)
+        else:
+            with external_api_slot(action="cover image"):
+                backend.generate(prompt, config.llm_negative_prompt, raw_tmp, width=width, height=height)
+        raw_tmp.replace(raw_path)
+    except Exception as exc:
+        raw_tmp.unlink(missing_ok=True)
+        on_log(f"  WARN cover image generation failed: {exc}; use placeholder")
+        _create_cover_placeholder(prompt, title, raw_path, width, height)
+
+    _render_cover_title(raw_path, out_path, title)
+    _write_json(
+        manifest_path,
+        {
+            "schema_version": 1,
+            "status": "ready",
+            "input_hash": expected_hash,
+            "title": title,
+            "provider": provider,
+            "prompt": prompt,
+            "raw_path": str(raw_path),
+            "path": str(out_path),
+            "file": _file_signature(out_path),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    )
+    on_log(f"  OK cover: {out_path}")
+    return out_path
+
+
+def _load_compose_manifest(path: Path) -> dict:
+    data = _read_json(path, {})
+    if not isinstance(data, dict):
+        data = {}
+    if not isinstance(data.get("steps"), dict):
+        data["steps"] = {}
+    data["schema_version"] = 1
+    return data
+
+
+def _compose_step_ready(manifest: dict, step: str, input_hash: str, out_path: Path) -> bool:
+    data = (manifest.get("steps") or {}).get(step) or {}
+    if str(data.get("input_hash") or "") != input_hash:
+        return False
+    if not out_path.exists():
+        return False
+    sig = _file_signature(out_path)
+    if int(data.get("file_size") or -1) != sig.get("size"):
+        return False
+    try:
+        if abs(float(data.get("file_mtime") or 0) - float(sig.get("mtime") or 0)) > 1.0:
+            return False
+    except Exception:
+        return False
+    return _audio_duration(out_path) > 0.05
+
+
+def _record_compose_step(manifest_path: Path, manifest: dict, step: str, input_hash: str, out_path: Path) -> None:
+    sig = _file_signature(out_path)
+    steps = manifest.setdefault("steps", {})
+    steps[step] = {
+        "status": "ready",
+        "input_hash": input_hash,
+        "path": str(out_path),
+        "duration": round(_audio_duration(out_path), 3),
+        "file_size": sig.get("size", 0),
+        "file_mtime": sig.get("mtime", 0),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    manifest["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _write_json(manifest_path, manifest)
+
+
+def _stage_compose_manifest_impl(
+    audios: list[Path],
+    durations: list[float],
+    segments: list[Segment],
+    plans: list[ImagePlan],
+    images: list[Path],
+    job_dir: Path,
+    on_log: LogFn,
+) -> Path:
+    on_log("[6/6] Video compose")
+    manifest_path = job_dir / "compose_manifest.json"
+    manifest = _load_compose_manifest(manifest_path)
+
+    audio_full = job_dir / "audio_full.mp3"
+    audio_hash = _stable_hash(
+        {
+            "kind": "audio_concat_v1",
+            "audios": [{"path": str(p), **_file_signature(p)} for p in audios],
+        }
+    )
+    if _compose_step_ready(manifest, "audio_concat", audio_hash, audio_full):
+        on_log("  reuse audio_full.mp3 from compose manifest")
+    else:
+        concat_audios(audios, audio_full, on_log)
+        _record_compose_step(manifest_path, manifest, "audio_concat", audio_hash, audio_full)
+
+    subs = []
+    t = 0.0
+    for seg, dur in zip(segments, durations):
+        end = t + max(0.05, dur)
+        subs.append((t, end, seg.text))
+        t = end
+
+    ass_path = job_dir / "subtitle.ass"
+    build_ass(
+        subs,
+        ass_path,
+        font=config.video_subtitle_font,
+        size=config.video_subtitle_size,
+        video_w=config.video_width,
+        video_h=config.video_height,
+        position=config.get("video_subtitle_position", "下边"),
+        primary_color=config.get("video_subtitle_color", "#FFFFFF"),
+        outline_color=config.get("video_subtitle_outline_color", "#000000"),
+        back_color=config.get("video_subtitle_back_color", "#000000"),
+        outline=float(config.get("video_subtitle_outline", 4.0) or 4.0),
+        shadow=float(config.get("video_subtitle_shadow", 1.0) or 1.0),
+        margin_v=int(config.get("video_subtitle_margin_v", 60) or 60),
+        margin_lr=int(config.get("video_subtitle_margin_lr", 56) or 56),
+        spacing=float(config.get("video_subtitle_spacing", 0.0) or 0.0),
+        bold=bool(config.get("video_subtitle_bold", False)),
+        italic=bool(config.get("video_subtitle_italic", False)),
+        chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
+        max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
+    )
+    if config.video_external_subtitle:
+        build_srt(
+            subs,
+            job_dir / "subtitle.srt",
+            chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
+            max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
+        )
+
+    bgm = Path(config.video_bgm_path) if config.video_bgm_path else None
+    image_durations = [p.duration for p in plans]
+    out = job_dir / "final.mp4"
+    final_hash = _stable_hash(
+        {
+            "kind": "final_video_v2",
+            "audio": {"path": str(audio_full), **_file_signature(audio_full)},
+            "images": [{"path": str(p), **_file_signature(p)} for p in images],
+            "image_durations": [round(float(v), 3) for v in image_durations],
+            "segments": [_text_hash(s.text) for s in segments],
+            "video": {
+                "width": config.video_width,
+                "height": config.video_height,
+                "fps": config.video_fps,
+                "encoder": config.get("video_encoder", "libx264"),
+                "encoder_preset": config.get("video_encoder_preset", "veryfast"),
+                "encoder_quality": config.get("video_encoder_quality", 20),
+                "ken_burns": bool(config.ken_burns),
+                "long_mode": bool(config.video_long_mode),
+                "motion": str(config.video_motion or "none"),
+                "motion_curve": str(config.get("video_motion_curve", "ease") or "ease"),
+                "motion_cycle_seconds": float(config.get("video_motion_cycle_seconds", 18.0) or 18.0),
+                "transition": str(config.video_transition or "none"),
+                "transition_duration": float(config.video_transition_duration or 0.4),
+                "subtitle": True,
+                "subtitle_font": config.video_subtitle_font,
+                "subtitle_size": config.video_subtitle_size,
+                "subtitle_style": {
+                    "position": config.get("video_subtitle_position", "下边"),
+                    "color": config.get("video_subtitle_color", "#FFFFFF"),
+                    "outline_color": config.get("video_subtitle_outline_color", "#000000"),
+                    "back_color": config.get("video_subtitle_back_color", "#000000"),
+                    "outline": config.get("video_subtitle_outline", 4.0),
+                    "shadow": config.get("video_subtitle_shadow", 1.0),
+                    "margin_v": config.get("video_subtitle_margin_v", 60),
+                    "margin_lr": config.get("video_subtitle_margin_lr", 56),
+                    "spacing": config.get("video_subtitle_spacing", 0.0),
+                    "bold": config.get("video_subtitle_bold", False),
+                    "italic": config.get("video_subtitle_italic", False),
+                    "chars_per_line": config.get("video_subtitle_chars_per_line", 24),
+                    "max_lines": config.get("video_subtitle_max_lines", 2),
+                },
+                "bgm": str(bgm) if bgm else "",
+                "bgm_sig": _file_signature(bgm) if bgm and bgm.exists() else {},
+                "bgm_volume": config.video_bgm_volume,
+            },
+        }
+    )
+    if _compose_step_ready(manifest, "final_video", final_hash, out):
+        on_log(f"  reuse final video: {out}")
+        return out
+
+    tmp = out.with_name(out.stem + ".tmp" + out.suffix)
+    tmp.unlink(missing_ok=True)
+    try:
+        build_video(
+            images=images,
+            image_durations=image_durations,
+            audio_path=audio_full,
+            out_path=tmp,
+            on_log=on_log,
+            width=config.video_width,
+            height=config.video_height,
+            fps=config.video_fps,
+            ken_burns=bool(config.ken_burns),
+            subtitle_ass=ass_path,
+            bgm_path=bgm,
+            bgm_volume=config.video_bgm_volume,
+            long_mode=config.video_long_mode,
+            cleanup_temp=config.video_cleanup_temp,
+            motion=str(config.video_motion or "none"),
+            motion_curve=str(config.get("video_motion_curve", "ease") or "ease"),
+            motion_cycle_seconds=float(config.get("video_motion_cycle_seconds", 18.0) or 18.0),
+            transition=config.video_transition,
+            transition_duration=float(config.video_transition_duration or 0.4),
+            video_encoder=str(config.get("video_encoder", "libx264") or "libx264"),
+            video_encoder_preset=str(config.get("video_encoder_preset", "veryfast") or "veryfast"),
+            video_encoder_quality=int(config.get("video_encoder_quality", 20) or 20),
+        )
+        video_duration = _audio_duration(tmp)
+        audio_duration = _audio_duration(audio_full)
+        if video_duration <= 0.05:
+            raise RuntimeError("final video duration is zero")
+        if audio_duration > 60 and video_duration < audio_duration * 0.75:
+            raise RuntimeError(f"final video too short: video={video_duration:.1f}s audio={audio_duration:.1f}s")
+        if audio_duration > 60 and video_duration < audio_duration * 0.95:
+            on_log(f"  WARN final video shorter than audio: video={video_duration:.1f}s audio={audio_duration:.1f}s")
+        tmp.replace(out)
+        _record_compose_step(manifest_path, manifest, "final_video", final_hash, out)
+    finally:
+        tmp.unlink(missing_ok=True)
+    on_log(f"  OK video completed: {out}")
+    return out
+
+
+def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, metadata: dict | None = None, on_log: LogFn = _noop) -> str:
+    if not bool(config.upload_enabled):
+        return ""
+    if str(config.youtube_upload_method or "browser").lower() != "browser":
+        on_log("  WARN only browser upload is wired in this build")
+        return ""
+    from app.upload import upload_to_youtube
+
+    metadata = metadata or {}
+    context = {
+        "title": title,
+        "short_title": metadata.get("short_title", ""),
+        "intro": metadata.get("intro", ""),
+        "author": metadata.get("author", ""),
+        "tags": str(config.youtube_tags or metadata.get("tags", "")),
+        "job_id": job_dir.name,
+    }
+    profile = _active_upload_profile()
+    title_template = str(profile.get("title_template") or config.youtube_title_template or "{title}")
+    description_template = str(profile.get("description") or config.youtube_description or "")
+    flow = _normalize_upload_flow(profile.get("flow") or config.browser_flow or "simple")
+    visibility = str(profile.get("visibility") or config.youtube_visibility or "PRIVATE").strip().upper()
+    upload_policy = str(profile.get("upload_policy") or config.browser_upload_policy or "BTRA")
+    ad_interval = int(profile.get("ad_interval") or config.browser_ad_interval or 60)
+    ad_start = int(profile.get("ad_start") or config.browser_ad_start or 0)
+
+    upload_title = _format_template(title_template, context, fallback=title).strip() or title
+    upload_description = _format_template(description_template, context, fallback="")
+    on_log(f"[7/7] YouTube browser upload: {upload_title}")
+    on_log(f"  upload profile={profile.get('name', '-') or '-'} flow={'精简' if flow == 'simple' else '完整'}")
+    video_id = upload_to_youtube(
+        video,
+        upload_title,
+        description=upload_description,
+        visibility=visibility,
+        cover_path=cover if cover and cover.exists() else None,
+        flow=flow,
+        upload_policy=upload_policy,
+        ad_interval=ad_interval,
+        ad_start=ad_start,
+        auto_restart=bool(config.browser_auto_restart),
+        stall_timeout_min=int(config.browser_stall_timeout_min or 10),
+        op_speed=str(config.browser_op_speed or "normal"),
+        on_log=on_log,
+        on_progress=lambda p: write_status(job_dir, stage="upload", upload_progress=float(p or 0)),
+    )
+    if not video_id:
+        raise RuntimeError("YouTube upload failed")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    _write_json(job_dir / "upload_result.json", {"video_id": video_id, "url": url, "title": upload_title, "description": upload_description})
+    on_log(f"  OK uploaded: {url}")
+    return url
+
+
+def _upload_profiles() -> list[dict]:
+    try:
+        raw = json.loads(str(config.get("browser_profiles", "[]") or "[]"))
+    except Exception:
+        raw = []
+    profiles = [p for p in raw if isinstance(p, dict)]
+    if profiles:
+        return profiles
+    return [
+        {
+            "name": "无创收精简流程",
+            "flow": "simple",
+            "upload_policy": "BTRA",
+            "ad_interval": 60,
+            "ad_start": 0,
+            "visibility": str(config.youtube_visibility or "PUBLIC"),
+            "title_template": "",
+            "description": "",
+        },
+        {
+            "name": "完整创收流程",
+            "flow": "full",
+            "upload_policy": str(config.browser_upload_policy or "BTRA"),
+            "ad_interval": int(config.browser_ad_interval or 60),
+            "ad_start": int(config.browser_ad_start or 0),
+            "visibility": str(config.youtube_visibility or "PUBLIC"),
+            "title_template": "",
+            "description": "",
+        },
+    ]
+
+
+def _active_upload_profile() -> dict:
+    profiles = _upload_profiles()
+    active = str(config.get("browser_active_profile", "") or "").strip()
+    for profile in profiles:
+        if str(profile.get("name", "")).strip() == active:
+            return dict(profile)
+    return dict(profiles[0]) if profiles else {}
+
+
+def _normalize_upload_flow(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if "full" in text or "完整" in text or "创收" in text:
+        return "full"
+    return "simple"
+
+
+def stage_compose(
+    audios: list[Path],
+    durations: list[float],
+    segments: list[Segment],
+    plans: list[ImagePlan],
+    images: list[Path],
+    job_dir: Path,
+    on_log: LogFn = _noop,
+) -> Path:
+    return _stage_compose_manifest_impl(audios, durations, segments, plans, images, job_dir, on_log)
+    audio_full = job_dir / "audio_full.mp3"
+    if not audio_full.exists() or _audio_duration(audio_full) <= 0.05:
+        concat_audios(audios, audio_full, on_log)
+
+    subs = []
+    t = 0.0
+    for seg, dur in zip(segments, durations):
+        end = t + max(0.05, dur)
+        subs.append((t, end, seg.text))
+        t = end
+
+    ass_path = job_dir / "subtitle.ass"
+    build_ass(
+        subs,
+        ass_path,
+        font=config.video_subtitle_font,
+        size=config.video_subtitle_size,
+        video_w=config.video_width,
+        video_h=config.video_height,
+        position=config.get("video_subtitle_position", "下边"),
+        primary_color=config.get("video_subtitle_color", "#FFFFFF"),
+        outline_color=config.get("video_subtitle_outline_color", "#000000"),
+        back_color=config.get("video_subtitle_back_color", "#000000"),
+        outline=float(config.get("video_subtitle_outline", 4.0) or 4.0),
+        shadow=float(config.get("video_subtitle_shadow", 1.0) or 1.0),
+        margin_v=int(config.get("video_subtitle_margin_v", 60) or 60),
+        margin_lr=int(config.get("video_subtitle_margin_lr", 56) or 56),
+        spacing=float(config.get("video_subtitle_spacing", 0.0) or 0.0),
+        bold=bool(config.get("video_subtitle_bold", False)),
+        italic=bool(config.get("video_subtitle_italic", False)),
+        chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
+        max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
+    )
+    if config.video_external_subtitle:
+        build_srt(
+            subs,
+            job_dir / "subtitle.srt",
+            chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
+            max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
+        )
+
+    bgm = Path(config.video_bgm_path) if config.video_bgm_path else None
+    out = job_dir / "final.mp4"
+    build_video(
+        images=images,
+        image_durations=[p.duration for p in plans],
+        audio_path=audio_full,
+        out_path=out,
+        on_log=on_log,
+        width=config.video_width,
+        height=config.video_height,
+        fps=config.video_fps,
+        ken_burns=bool(config.ken_burns),
+        subtitle_ass=ass_path,
+        bgm_path=bgm,
+        bgm_volume=config.video_bgm_volume,
+        long_mode=config.video_long_mode,
+        cleanup_temp=config.video_cleanup_temp,
+        motion=str(config.video_motion or "none"),
+        motion_curve=str(config.get("video_motion_curve", "ease") or "ease"),
+        motion_cycle_seconds=float(config.get("video_motion_cycle_seconds", 18.0) or 18.0),
+        transition=config.video_transition,
+        transition_duration=float(config.video_transition_duration or 0.4),
+        video_encoder=str(config.get("video_encoder", "libx264") or "libx264"),
+        video_encoder_preset=str(config.get("video_encoder_preset", "veryfast") or "veryfast"),
+        video_encoder_quality=int(config.get("video_encoder_quality", 20) or 20),
+    )
+    on_log(f"  OK 视频完成: {out}")
+    return out
+
+
+def run_full(
+    url_or_id: str,
+    on_log: LogFn = _noop,
+    on_prog: ProgFn = _noop,
+    job_id: str | None = None,
+    resume: bool = False,
+) -> dict:
+    job_id = job_id or new_job_id()
+    job_dir = job_dir_for(job_id)
+    if job_dir.exists() and not resume:
+        raise FileExistsError(f"任务目录已存在: {job_dir}")
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    def log(message: str):
+        append_log(job_dir, message)
+        on_log(message)
+
+    def progress(stage: str, value: float, **extra):
+        write_status(job_dir, job_id=job_id, stage=stage, progress=max(0.0, min(1.0, float(value))), **extra)
+        on_prog(value)
+
+    log(f"== Job {job_id} ==")
+    progress("starting", 0.0, input=url_or_id, site=config.scraper_site, worker_pid=os.getpid(), started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    try:
+        progress("scrape", 0.03)
+        novel = stage_scrape(
+            url_or_id,
+            site=config.scraper_site,
+            max_chars=config.scraper_max_chars,
+            on_log=log,
+        )
+        _write_novel(job_dir / "novel.json", novel)
+        metadata = stage_metadata(novel, job_dir, on_log=log)
+        progress("clean", 0.10, title=novel.title, short_title=metadata.get("short_title", ""))
+
+        segments = stage_clean(novel, on_log=log, job_dir=job_dir)
+        _write_json(job_dir / "segments.json", [{"i": s.index, "text": s.text} for s in segments])
+        progress("tts", 0.15, title=novel.title)
+
+        overlap_images = bool(config.get("pipeline_overlap_tts_images", True))
+        if overlap_images:
+            log("  overlap enabled: prefetch storyboard/images while TTS is running")
+            estimated_durs = [_estimated_speech_duration(s.text) for s in segments]
+            prefetch_plans = stage_pacing(segments, estimated_durs, on_log=log)
+            _write_json(job_dir / "plans_prefetch.json", [_image_plan_to_dict(p) for p in prefetch_plans])
+            prefetch_dir = job_dir / "_prefetch_images"
+            executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pipeline-overlap")
+            tts_future = executor.submit(
+                stage_tts,
+                segments,
+                job_dir,
+                log,
+                lambda p: progress("tts", 0.15 + p * 0.30, title=novel.title),
+            )
+            image_future = executor.submit(
+                stage_storyboard_and_image,
+                prefetch_plans,
+                prefetch_dir,
+                log,
+                lambda p: progress("images_prefetch", 0.18 + p * 0.28, title=novel.title),
+            )
+            try:
+                audios, durs = tts_future.result()
+                progress("pacing", 0.45, title=novel.title)
+                plans = stage_pacing(segments, durs, on_log=log)
+                _write_json(job_dir / "plans.json", [_image_plan_to_dict(p) for p in plans])
+                if _plan_signature(plans) == _plan_signature(prefetch_plans):
+                    progress("images", 0.50, title=novel.title)
+                    try:
+                        prefetch_images = image_future.result()
+                        images = _copy_prefetched_images(prefetch_images, prefetch_dir, job_dir)
+                        log("  reuse prefetched storyboard/images")
+                    except Exception as exc:
+                        log(f"  WARN prefetched images failed: {exc}; regenerating images after TTS")
+                        images = stage_storyboard_and_image(
+                            plans,
+                            job_dir,
+                            on_log=log,
+                            on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
+                        )
+                else:
+                    log("  prefetch plan differs from real TTS pacing; regenerating images with final pacing")
+                    try:
+                        image_future.result()
+                    except Exception as exc:
+                        log(f"  WARN discarded prefetch image task failed: {exc}")
+                    images = stage_storyboard_and_image(
+                        plans,
+                        job_dir,
+                        on_log=log,
+                        on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
+                    )
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+        else:
+            audios, durs = stage_tts(
+                segments,
+                job_dir,
+                on_log=log,
+                on_prog=lambda p: progress("tts", 0.15 + p * 0.30, title=novel.title),
+            )
+            progress("pacing", 0.45, title=novel.title)
+
+            plans = stage_pacing(segments, durs, on_log=log)
+            _write_json(job_dir / "plans.json", [_image_plan_to_dict(p) for p in plans])
+            progress("images", 0.50, title=novel.title)
+
+            images = stage_storyboard_and_image(
+                plans,
+                job_dir,
+                on_log=log,
+                on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
+            )
+        progress("cover", 0.89, title=novel.title)
+        cover = stage_cover(novel, segments, job_dir, on_log=log)
+        progress("compose", 0.90, title=novel.title, cover=str(cover or ""))
+
+        video = stage_compose(audios, durs, segments, plans, images, job_dir, on_log=log)
+        youtube_url = ""
+        if bool(config.upload_enabled):
+            progress("upload", 0.96, title=novel.title, short_title=metadata.get("short_title", ""), video=str(video), cover=str(cover or ""))
+            youtube_url = stage_upload(video, novel.title, cover, job_dir, metadata=metadata, on_log=log)
+
+        result = {
+            "job_id": job_id,
+            "job_dir": str(job_dir),
+            "video": str(video),
+            "cover": str(cover or ""),
+            "title": novel.title,
+            "short_title": metadata.get("short_title", ""),
+            "youtube_url": youtube_url,
+        }
+        _write_json(job_dir / "result.json", result)
+        progress(
+            "completed",
+            1.0,
+            title=novel.title,
+            short_title=metadata.get("short_title", ""),
+            video=str(video),
+            cover=str(cover or ""),
+            youtube_url=youtube_url,
+            worker_pid=None,
+            finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        return result
+    except Exception as exc:
+        log(f"ERROR 失败: {exc}\n{traceback.format_exc()}")
+        progress("failed", load_status(job_id).get("progress", 0), error=str(exc), worker_pid=None, finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        raise
+
+
+def _prompt_for_plan(llm: LLMBackend, plan: ImagePlan, on_log: LogFn, index: int) -> str:
+    if config.llm_api_key or config.llm_provider == "ollama":
+        try:
+            with external_api_slot(action=f"storyboard {index}"):
+                return llm.storyboard(plan.text)
+        except Exception as exc:
+            on_log(f"  WARN 分镜{index} LLM 失败: {exc}，用原文兜底")
+    return plan.text[:160] + ", " + config.llm_image_style_suffix
+
+
+def _plan_signature(plans: list[ImagePlan]) -> list[list[int]]:
+    return [[int(seg.index) for seg in plan.segments] for plan in plans]
+
+
+def _copy_prefetched_images(paths: list[Path], prefetch_dir: Path, job_dir: Path) -> list[Path]:
+    img_dir = job_dir / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    final_paths: list[Path] = []
+    for i, src in enumerate(paths):
+        suffix = src.suffix if src.suffix else ".png"
+        dst = img_dir / f"img_{i:05d}{suffix}"
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
+        final_paths.append(dst)
+    prompts = prefetch_dir / "prompts.json"
+    if prompts.exists():
+        shutil.copy2(prompts, job_dir / "prompts.json")
+    try:
+        shutil.rmtree(prefetch_dir)
+    except OSError:
+        pass
+    return final_paths
+
+
+def _estimated_speech_duration(text: str) -> float:
+    compact = "".join(text.split())
+    return max(1.2, min(45.0, len(compact) / 4.2))
+
+
+def _create_silence(out_path: Path, duration: float):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with ffmpeg_slot(action="silent audio"):
+        subprocess.run(
+            [
+                ffmpeg_path(),
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=24000:cl=mono",
+                "-t",
+                f"{duration:.3f}",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "64k",
+                str(out_path),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def _write_json(path: Path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _write_novel(path: Path, novel: Novel):
+    _write_json(
+        path,
+        {
+            "site": novel.site,
+            "id": novel.novel_id,
+            "title": novel.title,
+            "author": novel.author,
+            "description": novel.description,
+            "chapters": [{"index": c.index, "title": c.title, "text": c.text} for c in novel.chapters],
+        },
+    )
+
+
+def _image_plan_to_dict(plan: ImagePlan) -> dict:
+    return {
+        "image_index": plan.image_index,
+        "duration": plan.duration,
+        "segments": [{"index": s.index, "text": s.text} for s in plan.segments],
+    }
