@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 软件在线更新
+    url: https://github.com/1951779219/novel_video_pipeline_release/releases/latest
+    about: 只想下载最新版时，请到这里获取公开更新包。

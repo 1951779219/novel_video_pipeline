@@ -182,6 +182,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "dependency_last_report": "",
     "update_manifest_url": "https://github.com/1951779219/novel_video_pipeline_release/releases/latest/download/latest.json",
     "update_check_on_startup": True,
+    "feedback_issue_url": "https://github.com/1951779219/novel_video_pipeline_feedback/issues/new/choose",
 
     # 上传
     "upload_enabled": False,

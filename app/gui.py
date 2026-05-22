@@ -6,6 +6,7 @@ import json
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -299,13 +300,14 @@ class PipelineGUI:
         check("自动下载 FFmpeg", "dependency_auto_install_ffmpeg")
         check("自动安装 Chrome", "dependency_auto_install_browser")
         check("启动时检查更新", "update_check_on_startup")
+        row("反馈入口 URL", "feedback_issue_url", "", width=48)
         row("PIP 镜像", "dependency_pip_index_url", "", width=48)
         row("PIP 额外参数", "dependency_pip_extra_args", "", width=48)
         row("PIP 超时秒数", "dependency_pip_timeout_seconds", "1800")
         row("FFmpeg 下载地址", "dependency_ffmpeg_url", "", width=48)
         row("更新清单 URL", "update_manifest_url", "", width=48)
         row("依赖检测摘要", "dependency_last_report", "", width=48)
-        buttons(("检测/安装依赖", self._manual_dependency_check))
+        buttons(("检测/安装依赖", self._manual_dependency_check), ("提交反馈", self._open_feedback_url))
 
         ttk.Separator(body).pack(fill=tk.X, pady=8)
         ttk.Label(body, text="TTS", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
@@ -540,6 +542,20 @@ class PipelineGUI:
         except Exception:
             pass
         self._run_dependency_check(silent=False)
+
+    def _open_feedback_url(self):
+        try:
+            self._apply_config_form(save_profile=False)
+        except Exception:
+            pass
+        url = str(config.get("feedback_issue_url", "") or "").strip()
+        if not url:
+            messagebox.showwarning("未配置反馈入口", "请先填写反馈入口 URL。")
+            return
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            messagebox.showerror("无法打开反馈入口", str(exc))
 
     def _run_dependency_check(self, *, silent: bool):
         if ensure_dependencies is None:

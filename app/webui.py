@@ -567,6 +567,7 @@ def build_update_tab():
     with gr.Tab("软件更新"):
         gr.Markdown(f"### 当前版本 v{VERSION}")
         manifest = gr.Textbox(value=config.get("update_manifest_url", ""), label="更新清单 URL")
+        feedback_url = gr.Textbox(value=config.get("feedback_issue_url", ""), label="反馈入口 URL")
         check_start = gr.Checkbox(value=bool(config.get("update_check_on_startup", True)), label="桌面 GUI 启动时检查新版本")
         with gr.Row():
             save_btn = gr.Button("保存更新配置")
@@ -574,16 +575,19 @@ def build_update_tab():
             download_btn = gr.Button("下载更新包")
         status = gr.Markdown()
         notes = gr.Textbox(label="发布说明", lines=8, interactive=False)
+        feedback_link = gr.Markdown(f"[提交反馈]({config.get('feedback_issue_url', '')})")
         update_state = gr.State(None)
 
-        def _save_update_config(url, enabled):
+        def _save_update_config(url, feedback, enabled):
             config.set("update_manifest_url", str(url or "").strip())
+            config.set("feedback_issue_url", str(feedback or "").strip())
             config.set("update_check_on_startup", bool(enabled))
             config.save()
-            return "已保存更新配置"
+            link = str(feedback or "").strip()
+            return "已保存更新配置", f"[提交反馈]({link})" if link else "未配置反馈入口"
 
-        def _check(url, enabled):
-            _save_update_config(url, enabled)
+        def _check(url, feedback, enabled):
+            _save_update_config(url, feedback, enabled)
             try:
                 from app.updater import check_for_update
 
@@ -605,8 +609,8 @@ def build_update_tab():
             except Exception as exc:
                 return f"下载失败：{exc}"
 
-        save_btn.click(_save_update_config, [manifest, check_start], [status])
-        check_btn.click(_check, [manifest, check_start], [status, notes, update_state])
+        save_btn.click(_save_update_config, [manifest, feedback_url, check_start], [status, feedback_link])
+        check_btn.click(_check, [manifest, feedback_url, check_start], [status, notes, update_state])
         download_btn.click(_download, [update_state], [status])
 
 

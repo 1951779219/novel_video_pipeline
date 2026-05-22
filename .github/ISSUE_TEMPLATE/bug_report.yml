@@ -1,0 +1,49 @@
+name: Bug 反馈
+description: 软件报错、失败、卡住、结果异常
+title: "[Bug] "
+labels: ["type:bug", "needs:triage"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: 出问题的环节
+      options:
+        - 启动/依赖检测
+        - 小说搜索/抓取
+        - 正文清洗/切片
+        - TTS 配音
+        - 分镜/生图
+        - 视频合成/字幕
+        - YouTube 上传
+        - 在线更新
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述
+      description: 说清楚你看到的现象、报错文字、卡在哪一步。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 尽量写成 1、2、3 步，方便定位。
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或截图文字
+      description: 可粘贴 `data/jobs/<job_id>/log.txt` 尾部、弹窗报错、命令行输出。
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: 软件版本
+      placeholder: v1.0.0
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      placeholder: Windows 10 / Windows 11

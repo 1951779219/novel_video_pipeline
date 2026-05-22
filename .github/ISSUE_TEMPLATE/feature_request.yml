@@ -1,0 +1,33 @@
+name: 功能建议
+description: 希望增加、优化或调整某个能力
+title: "[Feature] "
+labels: ["type:feature", "needs:triage"]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: 你想解决什么问题
+      description: 描述当前哪里不顺手，或者缺少什么能力。
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: 希望的效果
+      description: 写出你希望软件怎么做，越具体越好。
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 相关环节
+      options:
+        - 小说搜索/抓取
+        - 正文清洗/切片
+        - TTS 配音
+        - 分镜/生图
+        - 视频合成/字幕
+        - YouTube 上传
+        - 在线更新
+        - UI/批量操作
+        - 其他
