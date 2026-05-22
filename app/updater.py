@@ -8,7 +8,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -57,6 +59,9 @@ def fetch_manifest(config: Any | None = None) -> dict[str, Any]:
     url = manifest_url(config)
     if not url:
         raise UpdateError("未配置更新清单 URL")
+    if url.lower().startswith(("http://", "https://")):
+        sep = "&" if urllib.parse.urlparse(url).query else "?"
+        url = f"{url}{sep}_ts={int(time.time())}"
     req = urllib.request.Request(url, headers={"User-Agent": f"novel-video-pipeline/{VERSION}"})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:

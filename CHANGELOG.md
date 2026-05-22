@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.2
+
+- Added cache-busting to update manifest checks so GitHub `latest.json` does not get stuck on an older release.
+
 ## v1.0.1
 
 - Added the public feedback entry for users to submit bugs and feature requests.
