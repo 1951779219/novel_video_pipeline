@@ -11,6 +11,7 @@ import html
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -137,13 +138,103 @@ def _safe_job_path(job_id: str) -> Path:
     return path
 
 
-def delete_job(job_id: str) -> bool:
+def _terminate_process_tree(pid: int, *, timeout_seconds: float = 8.0) -> bool:
+    if not pid_alive(pid):
+        return True
+    if os.name == "nt":
+        proc = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if not pid_alive(pid):
+                return True
+            time.sleep(0.2)
+        return proc.returncode == 0 and not pid_alive(pid)
+
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.2)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    return not pid_alive(pid)
+
+
+def stop_job(job_id: str) -> bool:
+    path = _safe_job_path(job_id)
+    st = load_status(job_id)
+    pid = st.get("worker_pid")
+    try:
+        pid_int = int(pid or 0)
+    except Exception:
+        pid_int = 0
+
+    if not path.exists():
+        return False
+    if not pid_int or not pid_alive(pid_int):
+        write_status(
+            path,
+            stage="stopped" if st.get("stage") not in {"completed", "failed"} else st.get("stage"),
+            worker_pid=None,
+            stopped_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        append_log(path, "stop requested: worker was not running")
+        return False
+
+    append_log(path, f"stop requested: terminating worker pid={pid_int}")
+    write_status(path, stage="stopping", worker_pid=pid_int, stopped_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    ok = _terminate_process_tree(pid_int)
+    if not ok:
+        write_status(path, stage="stop_failed", worker_pid=pid_int, error=f"无法停止 worker pid={pid_int}")
+        append_log(path, f"stop failed: worker pid={pid_int} is still alive")
+        raise RuntimeError(f"{job_id} 停止失败，worker pid={pid_int} 仍在运行")
+    write_status(path, stage="stopped", worker_pid=None, stopped_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    append_log(path, f"worker pid={pid_int} stopped by user")
+    return True
+
+
+def delete_job(job_id: str, *, stop_running: bool = False) -> bool:
     if is_worker_running(job_id):
-        raise RuntimeError(f"{job_id} 仍在运行，不能删除")
+        if not stop_running:
+            raise RuntimeError(f"{job_id} 仍在运行，不能删除")
+        stop_job(job_id)
     path = _safe_job_path(job_id)
     if not path.exists():
         return False
-    shutil.rmtree(path)
+    last_error: Exception | None = None
+    for _ in range(8):
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return False
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.25)
+    if last_error:
+        raise last_error
     return True
 
 

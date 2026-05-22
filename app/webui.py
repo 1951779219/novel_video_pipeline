@@ -463,6 +463,8 @@ def build_pipeline_tab():
         with gr.Row():
             resume_job = gr.Textbox(value="", label="续跑 job_id，可空")
             start_btn = gr.Button("启动后台任务", variant="primary")
+            stop_btn = gr.Button("停止当前任务")
+            delete_btn = gr.Button("停止并删除当前任务")
             refresh_btn = gr.Button("刷新状态")
         current_job = gr.Textbox(label="当前 job_id", interactive=True)
         progress = gr.Slider(0, 1, value=0, label="进度", interactive=False)
@@ -503,7 +505,31 @@ def build_pipeline_tab():
             )
             return float(st.get("progress", 0) or 0), md, pr.tail_log(job_id), video_path, st
 
+        def _stop(job_id):
+            job_id = (job_id or "").strip()
+            if not job_id:
+                return 0, "未启动任务", "", None, {}
+            try:
+                pr.stop_job(job_id)
+                ACTIVE_JOBS.pop(job_id, None)
+            except Exception as exc:
+                return 0, f"停止失败: {exc}", pr.tail_log(job_id), None, pr.load_status(job_id)
+            return _refresh(job_id)
+
+        def _delete(job_id):
+            job_id = (job_id or "").strip()
+            if not job_id:
+                return "", 0, "未选择任务", "", None, {}
+            try:
+                pr.delete_job(job_id, stop_running=True)
+                ACTIVE_JOBS.pop(job_id, None)
+            except Exception as exc:
+                return job_id, 0, f"删除失败: {exc}", pr.tail_log(job_id), None, pr.load_status(job_id)
+            return "", 0, f"已删除任务：{job_id}", "", None, {}
+
         start_btn.click(_start, [pipeline_input, resume_job], [current_job, progress, status, log, video_out, result_json])
+        stop_btn.click(_stop, [current_job], [progress, status, log, video_out, result_json])
+        delete_btn.click(_delete, [current_job], [current_job, progress, status, log, video_out, result_json])
         refresh_btn.click(_refresh, [current_job], [progress, status, log, video_out, result_json])
         timer.tick(_refresh, [current_job], [progress, status, log, video_out, result_json])
         return pipeline_input
@@ -513,7 +539,10 @@ def build_jobs_tab():
     with gr.Tab("任务记录"):
         btn = gr.Button("刷新任务列表")
         job_id = gr.Textbox(label="查看 job_id")
-        detail_btn = gr.Button("查看详情")
+        with gr.Row():
+            detail_btn = gr.Button("查看详情")
+            stop_btn = gr.Button("停止任务")
+            delete_btn = gr.Button("停止并删除任务")
         table = gr.Dataframe(headers=["job_id", "stage", "progress", "worker_pid", "worker_alive", "title", "video", "updated_at"], label="Jobs with worker state")
         status = gr.JSON(label="status.json")
         log = gr.Textbox(label="日志尾部", lines=18, interactive=False)
@@ -524,8 +553,30 @@ def build_jobs_tab():
         def _detail(j):
             return pr.load_status(j), pr.tail_log(j)
 
+        def _stop(j):
+            j = (j or "").strip()
+            if not j:
+                return _list(), {}, "请先填写 job_id"
+            try:
+                pr.stop_job(j)
+            except Exception as exc:
+                return _list(), pr.load_status(j), f"停止失败: {exc}\n\n{pr.tail_log(j)}"
+            return _list(), pr.load_status(j), pr.tail_log(j)
+
+        def _delete(j):
+            j = (j or "").strip()
+            if not j:
+                return _list(), {}, "请先填写 job_id"
+            try:
+                pr.delete_job(j, stop_running=True)
+            except Exception as exc:
+                return _list(), pr.load_status(j), f"删除失败: {exc}\n\n{pr.tail_log(j)}"
+            return _list(), {}, f"已删除任务：{j}"
+
         btn.click(_list, [], [table])
         detail_btn.click(_detail, [job_id], [status, log])
+        stop_btn.click(_stop, [job_id], [table, status, log])
+        delete_btn.click(_delete, [job_id], [table, status, log])
 
 
 def build_upload_tab():

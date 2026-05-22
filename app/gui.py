@@ -155,6 +155,7 @@ class PipelineGUI:
         toolbar.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(toolbar, text="启动选中", style="Primary.TButton", command=self._start_selected).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="启动全部待处理", command=self._start_all_pending).pack(side=tk.LEFT, padx=6)
+        ttk.Button(toolbar, text="停止选中", command=self._stop_selected_jobs).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="刷新", command=self._refresh_jobs).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="打开任务目录", command=self._open_selected_dir).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="清除图片缓存", command=self._clear_selected_media_cache).pack(side=tk.LEFT, padx=6)
@@ -949,16 +950,42 @@ class PipelineGUI:
         if errors:
             messagebox.showerror("清除失败", "\n".join(errors))
 
+    def _stop_selected_jobs(self):
+        ids = self._selected_job_ids()
+        if not ids:
+            return
+        running = [job_id for job_id in ids if pr.load_status(job_id).get("worker_alive")]
+        if not running:
+            messagebox.showinfo("无需停止", "选中的任务没有正在运行的 worker。")
+            return
+        if not messagebox.askyesno("确认停止任务", f"将强制停止 {len(running)} 个正在运行的任务。已生成的中间文件会保留，可之后续跑。继续吗？"):
+            return
+        errors = []
+        for job_id in running:
+            try:
+                pr.stop_job(job_id)
+            except Exception as exc:
+                errors.append(f"{job_id}: {exc}")
+        self._refresh_jobs()
+        self._update_log()
+        if errors:
+            messagebox.showerror("停止失败", "\n".join(errors))
+
     def _delete_selected_jobs(self):
         ids = self._selected_job_ids()
         if not ids:
             return
-        if not messagebox.askyesno("确认删除任务", f"将删除 {len(ids)} 个任务目录。运行中的任务不会删除。继续吗？"):
+        running = [job_id for job_id in ids if pr.load_status(job_id).get("worker_alive")]
+        if running:
+            message = f"将删除 {len(ids)} 个任务目录，其中 {len(running)} 个正在运行，会先强制停止再删除。此操作不可恢复。继续吗？"
+        else:
+            message = f"将删除 {len(ids)} 个任务目录。此操作不可恢复。继续吗？"
+        if not messagebox.askyesno("确认删除任务", message):
             return
         errors = []
         for job_id in ids:
             try:
-                pr.delete_job(job_id)
+                pr.delete_job(job_id, stop_running=True)
             except Exception as exc:
                 errors.append(f"{job_id}: {exc}")
         self._selected_job = ""

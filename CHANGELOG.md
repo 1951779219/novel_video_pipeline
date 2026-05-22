@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.3
+
+- Added task stop controls for running workers in the desktop GUI and WebUI.
+- Running tasks can now be stopped before deletion, including process-tree termination on Windows.
+- Deleting a running task now stops the worker first and retries directory removal.
+
 ## v1.0.2
 
 - Added cache-busting to update manifest checks so GitHub `latest.json` does not get stuck on an older release.
