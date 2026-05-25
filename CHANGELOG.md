@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.4
+
+- Fixed duplicate job IDs when importing multiple TXT files in the same second, so queued batch imports no longer overwrite each other.
+
 ## v1.0.3
 
 - Added task stop controls for running workers in the desktop GUI and WebUI.

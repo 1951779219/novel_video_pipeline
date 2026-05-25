@@ -55,8 +55,28 @@ def _noop(*_args, **_kwargs):
     pass
 
 
+_JOB_ID_LOCK = threading.Lock()
+_JOB_ID_LAST_STAMP = ""
+_JOB_ID_SEQUENCE = 0
+
+
 def new_job_id(prefix: str = "job") -> str:
-    return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
+    global _JOB_ID_LAST_STAMP, _JOB_ID_SEQUENCE
+
+    with _JOB_ID_LOCK:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        if stamp == _JOB_ID_LAST_STAMP:
+            _JOB_ID_SEQUENCE += 1
+        else:
+            _JOB_ID_LAST_STAMP = stamp
+            _JOB_ID_SEQUENCE = 0
+
+        suffix = "" if _JOB_ID_SEQUENCE == 0 else f"_{_JOB_ID_SEQUENCE:03d}"
+        candidate = f"{prefix}_{stamp}{suffix}"
+        while job_dir_for(candidate).exists():
+            _JOB_ID_SEQUENCE += 1
+            candidate = f"{prefix}_{stamp}_{_JOB_ID_SEQUENCE:03d}"
+        return candidate
 
 
 def job_dir_for(job_id: str) -> Path:
