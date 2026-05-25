@@ -118,9 +118,48 @@ def load_status(job_id: str) -> dict:
     try:
         status = json.loads(path.read_text(encoding="utf-8"))
         status["worker_alive"] = pid_alive(status.get("worker_pid"))
+        status["stage_display"] = stage_display(status)
         return status
     except Exception as exc:
         return {"job_id": job_id, "stage": "broken", "progress": 0, "error": str(exc)}
+
+
+_STAGE_LABELS = {
+    "queued": "等待启动",
+    "starting": "启动中",
+    "scrape": "1/6 读取文本",
+    "clean": "2/6 清洗切片",
+    "tts": "3/6 配音",
+    "images_prefetch": "4/6 预生成图片",
+    "pacing": "4/6 规划画面",
+    "images": "4/6 生成图片",
+    "cover": "5/6 生成封面",
+    "compose": "5/6 合成视频",
+    "upload": "6/6 上传",
+    "completed": "完成",
+    "failed": "失败",
+    "stopping": "停止中",
+    "stopped": "已停止",
+    "stop_failed": "停止失败",
+    "missing": "目录缺失",
+    "broken": "状态损坏",
+}
+
+
+def stage_display(status: dict) -> str:
+    stage = str(status.get("stage") or "")
+    label = _STAGE_LABELS.get(stage, stage or "未知")
+    try:
+        progress = max(0.0, min(1.0, float(status.get("progress") or 0)))
+    except Exception:
+        progress = 0.0
+    if stage == "upload" and status.get("upload_progress") is not None:
+        try:
+            upload_progress = max(0.0, min(1.0, float(status.get("upload_progress") or 0)))
+            return f"{label} {upload_progress * 100:.0f}%"
+        except Exception:
+            pass
+    return f"{label} {progress * 100:.0f}%"
 
 
 def list_jobs(limit: int = 50) -> list[dict]:
@@ -133,6 +172,7 @@ def list_jobs(limit: int = 50) -> list[dict]:
             {
                 "job_id": d.name,
                 "stage": st.get("stage", ""),
+                "stage_display": stage_display(st),
                 "progress": st.get("progress", 0),
                 "title": st.get("title", ""),
                 "video": st.get("video", ""),

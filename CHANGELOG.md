@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.5
+
+- Added a user-facing production-stage display in the desktop GUI and WebUI so users can see whether a task is reading text, cleaning, generating speech, generating images, composing video, or uploading.
+- Included the readable production stage in task status data to make stuck or long-running jobs easier to diagnose.
+
 ## v1.0.4
 
 - Fixed duplicate job IDs when importing multiple TXT files in the same second, so queued batch imports no longer overwrite each other.

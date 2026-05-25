@@ -498,7 +498,7 @@ def build_pipeline_tab():
             video = st.get("video") or ""
             video_path = video if video and Path(video).exists() else None
             md = (
-                f"状态：{st.get('stage', '')} / {running}  \n"
+                f"制作阶段：{pr.stage_display(st)} / {running}  \n"
                 f"标题：{st.get('title', '')}  \n"
                 f"更新时间：{st.get('updated_at', '')}  \n"
                 f"目录：{pr.job_dir_for(job_id)}"
@@ -543,12 +543,12 @@ def build_jobs_tab():
             detail_btn = gr.Button("查看详情")
             stop_btn = gr.Button("停止任务")
             delete_btn = gr.Button("停止并删除任务")
-        table = gr.Dataframe(headers=["job_id", "stage", "progress", "worker_pid", "worker_alive", "title", "video", "updated_at"], label="Jobs with worker state")
+        table = gr.Dataframe(headers=["job_id", "制作阶段", "stage", "progress", "worker_pid", "worker_alive", "title", "video", "updated_at"], label="Jobs with worker state")
         status = gr.JSON(label="status.json")
         log = gr.Textbox(label="日志尾部", lines=18, interactive=False)
 
         def _list():
-            return [[r["job_id"], r["stage"], r["progress"], r.get("worker_pid"), r.get("worker_alive"), r["title"], r["video"], r["updated_at"]] for r in pr.list_jobs()]
+            return [[r["job_id"], r.get("stage_display", r["stage"]), r["stage"], r["progress"], r.get("worker_pid"), r.get("worker_alive"), r["title"], r["video"], r["updated_at"]] for r in pr.list_jobs()]
 
         def _detail(j):
             return pr.load_status(j), pr.tail_log(j)

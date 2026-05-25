@@ -166,14 +166,14 @@ class PipelineGUI:
         self.job_tree = ttk.Treeview(box, columns=cols, show="headings", selectmode="extended")
         headings = {
             "job_id": "任务ID",
-            "stage": "阶段",
+            "stage": "制作阶段",
             "progress": "进度",
             "worker": "Worker",
             "title": "标题",
             "video": "视频",
             "youtube": "YouTube",
         }
-        widths = {"job_id": 170, "stage": 88, "progress": 62, "worker": 88, "title": 170, "video": 210, "youtube": 180}
+        widths = {"job_id": 170, "stage": 150, "progress": 62, "worker": 88, "title": 150, "video": 190, "youtube": 170}
         for col in cols:
             self.job_tree.heading(col, text=headings[col])
             self.job_tree.column(col, width=widths[col], anchor=tk.W)
@@ -1019,7 +1019,7 @@ class PipelineGUI:
             worker = f"PID {st.get('worker_pid')}" if st.get("worker_alive") else ""
             values = (
                 row["job_id"],
-                row.get("stage", ""),
+                row.get("stage_display", row.get("stage", "")),
                 f"{float(row.get('progress') or 0) * 100:.0f}%",
                 worker,
                 row.get("title", ""),
