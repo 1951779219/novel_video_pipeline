@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.6
+
+- Improved OpenAI-compatible image generation errors so HTTP failures include a redacted response summary and a model hint when an unsupported `gpt-image-*` model may be configured.
+
 ## v1.0.5
 
 - Added a user-facing production-stage display in the desktop GUI and WebUI so users can see whether a task is reading text, cleaning, generating speech, generating images, composing video, or uploading.

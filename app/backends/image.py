@@ -11,6 +11,7 @@
 import base64
 import io
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -27,6 +28,33 @@ def _openai_image_size(model: str, width: int, height: int) -> str:
     if "gpt-image" in text or "gemini" in text:
         return "1024x1536" if height >= width else "1536x1024"
     return "1024x1792" if height >= width else "1792x1024"
+
+
+def _redact_http_detail(text: str, limit: int = 700) -> str:
+    detail = " ".join(str(text or "").split())
+    detail = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1***", detail)
+    detail = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-***", detail)
+    detail = re.sub(r"(?i)(api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+", r"\1***", detail)
+    if len(detail) > limit:
+        detail = detail[:limit].rstrip() + "..."
+    return detail or "-"
+
+
+def _http_error_detail(exc: httpx.HTTPStatusError) -> str:
+    response = exc.response
+    status = response.status_code if response is not None else "?"
+    try:
+        body = response.text if response is not None else ""
+    except Exception:
+        body = ""
+    return f"HTTP {status}: {_redact_http_detail(body)}"
+
+
+def _image_model_hint(model: str) -> str:
+    text = str(model or "").strip().lower()
+    if text.startswith("gpt-image") and text != "gpt-image-1":
+        return " Hint: this image model may not be supported by the /images/generations endpoint; try gpt-image-1 or use API probe to pick an available image model."
+    return ""
 
 
 class ImageBackend:
@@ -177,10 +205,18 @@ class ImageBackend:
             r.raise_for_status()
         except httpx.HTTPStatusError as exc:
             # Older OpenAI-compatible relays often require response_format.
+            first_error = _http_error_detail(exc)
             retry_payload = dict(payload)
             retry_payload["response_format"] = "b64_json"
-            r = httpx.post(url, json=retry_payload, headers=headers, timeout=self.timeout_seconds)
-            r.raise_for_status()
+            try:
+                r = httpx.post(url, json=retry_payload, headers=headers, timeout=self.timeout_seconds)
+                r.raise_for_status()
+            except httpx.HTTPStatusError as retry_exc:
+                retry_error = _http_error_detail(retry_exc)
+                hint = _image_model_hint(str(payload.get("model") or ""))
+                raise RuntimeError(
+                    f"OpenAI image request failed after retry. first={first_error}; retry={retry_error}.{hint}"
+                ) from retry_exc
         data = r.json()
         row = (data.get("data") or [{}])[0]
         b64_value = row.get("b64_json") or row.get("image") or row.get("content")
