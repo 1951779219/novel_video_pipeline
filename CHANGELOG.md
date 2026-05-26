@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.7
+
+- Preserve generated image aspect ratio when fitting OpenAI-compatible image results into configured video or cover dimensions, preventing 16:9 covers from being stretched.
+- Improved cover title rendering with a softer gradient title band, accent line, shadow, and stroke for better readability and visual blending.
+- Added a warning when imported text reaches `scraper_max_chars`, making partial-video reports easier to diagnose without changing generation length or API usage.
+
 ## v1.0.6
 
 - Improved OpenAI-compatible image generation errors so HTTP failures include a redacted response summary and a model hint when an unsupported `gpt-image-*` model may be configured.

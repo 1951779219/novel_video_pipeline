@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 def _openai_image_size(model: str, width: int, height: int) -> str:
@@ -55,6 +55,15 @@ def _image_model_hint(model: str) -> str:
     if text.startswith("gpt-image") and text != "gpt-image-1":
         return " Hint: this image model may not be supported by the /images/generations endpoint; try gpt-image-1 or use API probe to pick an available image model."
     return ""
+
+
+def _fit_generated_image(img: Image.Image, width: int, height: int) -> Image.Image:
+    return ImageOps.fit(
+        img.convert("RGB"),
+        (max(1, int(width)), max(1, int(height))),
+        method=Image.LANCZOS,
+        centering=(0.5, 0.5),
+    )
 
 
 class ImageBackend:
@@ -195,8 +204,7 @@ class ImageBackend:
             "size": _openai_image_size(model, w, h),
             "n": 1,
         }
-        img = self._post_openai_image(url, headers, payload)
-        img = img.resize((w, h), Image.LANCZOS)
+        img = _fit_generated_image(self._post_openai_image(url, headers, payload), w, h)
         img.save(out_path, "PNG")
 
     def _post_openai_image(self, url: str, headers: dict, payload: dict) -> Image.Image:
@@ -250,8 +258,8 @@ class ImageBackend:
         else:
             img_bytes = httpx.get(data["url"], timeout=min(120.0, self.timeout_seconds)).content
             img = Image.open(io.BytesIO(img_bytes))
-        # 缩放到目标尺寸
-        img = img.resize((w, h), Image.LANCZOS)
+        # Fit to the configured canvas without distorting the generated artwork.
+        img = _fit_generated_image(img, w, h)
         img.save(out_path, "PNG")
 
     def _gen_custom(self, prompt, negative, out_path, w, h):

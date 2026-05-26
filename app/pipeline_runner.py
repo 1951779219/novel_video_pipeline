@@ -475,10 +475,19 @@ def stage_scrape(
     max_chars: int = 0,
     on_log: LogFn = _noop,
 ) -> Novel:
+    def warn_if_limited(novel: Novel) -> None:
+        try:
+            limit = int(max_chars or 0)
+        except Exception:
+            limit = 0
+        if limit > 0 and len(novel.full_text) >= limit:
+            on_log(f"  WARN text reached scraper_max_chars={limit}; set it to 0 to process the full text")
+
     if _looks_like_text_source(url_or_id, site):
         novel = _novel_from_text_source(url_or_id, max_chars=max_chars)
         on_log(f"[1/6] Local text: {novel.title}")
         on_log(f"  OK title={novel.title} chars={len(novel.full_text)}")
+        warn_if_limited(novel)
         if not novel.full_text.strip():
             raise RuntimeError("local text is empty")
         return novel
@@ -1393,7 +1402,12 @@ def _render_cover_title(raw_path: Path, out_path: Path, title: str) -> Path:
     fg = _hex_rgb(str(config.get("cover_title_color", "#FFFFFF")), (255, 255, 255))
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay)
-    overlay_draw.rectangle((0, height - band_h, width, height), fill=(*bg, 218))
+    band_top = height - band_h
+    for yy in range(band_top, height):
+        t = (yy - band_top) / max(1, band_h - 1)
+        alpha = int(86 + 158 * (t ** 1.65))
+        overlay_draw.line((0, yy, width, yy), fill=(*bg, alpha))
+    overlay_draw.line((0, band_top, width, band_top), fill=(*fg, 64), width=max(2, height // 360))
     img = Image.alpha_composite(img, overlay)
 
     draw = ImageDraw.Draw(img)
@@ -1412,11 +1426,12 @@ def _render_cover_title(raw_path: Path, out_path: Path, title: str) -> Path:
     total_h = len(lines) * line_h + max(0, len(lines) - 1) * spacing
     y = height - band_h + (band_h - total_h) / 2
     shadow = max(2, int(getattr(font, "size", 40) * 0.04))
+    stroke = max(2, int(getattr(font, "size", 40) * 0.055))
     for line in lines:
         line_w = _text_width(draw, line, font)
         x = (width - line_w) / 2
-        draw.text((x + shadow, y + shadow), line, fill=(0, 0, 0, 185), font=font)
-        draw.text((x, y), line, fill=(*fg, 255), font=font)
+        draw.text((x + shadow, y + shadow), line, fill=(0, 0, 0, 165), font=font)
+        draw.text((x, y), line, fill=(*fg, 255), font=font, stroke_width=stroke, stroke_fill=(0, 0, 0, 205))
         y += line_h + spacing
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
