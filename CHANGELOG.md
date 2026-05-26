@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.9
+
+- Added `max_concurrent_jobs` configuration (default 2) to control how many worker processes may run simultaneously, preventing resource exhaustion while allowing parallel processing.
+- Added a "retrying" log message when a TTS segment fails and will be retried, so users can see that the system is still working rather than stuck.
+- Added a placeholder hint in the desktop GUI log tab when no job is selected, making it clearer how to view real-time task logs.
+
 ## v1.0.8
 
 - Changed the default text import limit to unlimited and migrates the legacy 8000-character default so full local TXT files are processed by default.

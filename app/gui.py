@@ -1045,6 +1045,10 @@ class PipelineGUI:
 
     def _update_log(self):
         if not self._selected_job:
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.delete("1.0", tk.END)
+            self.log_text.insert(tk.END, "请在左侧选择一个任务以查看实时日志")
+            self.log_text.configure(state=tk.DISABLED)
             return
         text = pr.tail_log(self._selected_job, lines=500)
         self.log_text.configure(state=tk.NORMAL)

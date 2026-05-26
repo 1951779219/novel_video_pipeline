@@ -166,6 +166,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "video_long_mode": True,
     "video_cleanup_temp": True,
 
+    "max_concurrent_jobs": 2,
     "max_concurrent_external_api": 2,
     "max_concurrent_ffmpeg": 1,
     "max_concurrent_media_probe": 2,

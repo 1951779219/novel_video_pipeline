@@ -190,6 +190,20 @@ def is_worker_running(job_id: str) -> bool:
     return bool(load_status(job_id).get("worker_alive"))
 
 
+def count_running_workers() -> int:
+    """Count how many worker processes are currently alive across all jobs."""
+    if not JOBS_DIR.exists():
+        return 0
+    count = 0
+    for d in JOBS_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        st = load_status(d.name)
+        if st.get("worker_alive"):
+            count += 1
+    return count
+
+
 def _safe_job_path(job_id: str) -> Path:
     root = JOBS_DIR.resolve()
     path = job_dir_for(job_id).resolve()
@@ -331,6 +345,14 @@ def start_worker(input_text: str, job_id: str | None = None, resume: bool = Fals
     job_dir = job_dir_for(job_id)
     if job_dir.exists() and not resume:
         raise FileExistsError(f"job directory already exists: {job_dir}")
+
+    max_jobs = max(1, int(config.get("max_concurrent_jobs", 2)))
+    running = count_running_workers()
+    if running >= max_jobs:
+        raise RuntimeError(
+            f"已达到最大并行任务数限制 ({running}/{max_jobs})，请等待当前任务完成后再启动新任务。"
+            "可在配置中调整 max_concurrent_jobs 提高上限。"
+        )
     job_dir.mkdir(parents=True, exist_ok=True)
 
     command = [
@@ -882,6 +904,7 @@ def _stage_tts_manifest_impl(
                     )
                     on_log(f"  WARN seg{i} TTS failed {attempt}/{retries}: {exc}")
                     if attempt < retries:
+                        on_log(f"    ↻ TTS seg{i} 重试中 (第 {attempt + 1}/{retries} 次)...")
                         time.sleep(min(8, attempt * 1.5))
             if d <= 0.05 and config.tts_fail_silence:
                 d = _estimated_speech_duration(seg.text)
