@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.8
+
+- Changed the default text import limit to unlimited and migrates the legacy 8000-character default so full local TXT files are processed by default.
+- Updated default YouTube title and description templates to the requested short-video format, with upload titles capped around 100 characters.
+- Added a cross-process upload queue lock so multiple completed jobs upload to YouTube one at a time.
+- Runs the full dependency check before browser upload so missing Playwright/Chrome prerequisites can be repaired before the upload step.
+
 ## v1.0.7
 
 - Preserve generated image aspect ratio when fitting OpenAI-compatible image results into configured video or cover dimensions, preventing 16:9 covers from being stretched.

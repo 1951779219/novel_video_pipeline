@@ -232,6 +232,8 @@ def build_config_tab():
         with gr.Accordion("上传", open=False):
             youtube_visibility = gr.Dropdown(VIS, value=config.youtube_visibility, label="YouTube 可见性")
             youtube_tags = gr.Textbox(value=config.youtube_tags, label="标签，逗号分隔")
+            youtube_title_template = gr.Textbox(value=config.youtube_title_template, label="默认标题模板", lines=2)
+            youtube_title_max_chars = gr.Number(value=config.get("youtube_title_max_chars", 100), label="标题字数上限", precision=0)
             youtube_description = gr.Textbox(value=config.youtube_description, label="默认描述", lines=3)
 
         save_btn = gr.Button("保存配置", variant="primary")
@@ -299,6 +301,8 @@ def build_config_tab():
             video_cleanup_temp,
             youtube_visibility,
             youtube_tags,
+            youtube_title_template,
+            youtube_title_max_chars,
             youtube_description,
             max_concurrent_external_api,
             max_concurrent_ffmpeg,
@@ -365,12 +369,14 @@ def build_config_tab():
                 "video_cleanup_temp": bool(vals[49]),
                 "youtube_visibility": vals[50],
                 "youtube_tags": vals[51],
-                "youtube_description": vals[52],
-                "max_concurrent_external_api": int(vals[53] or 1),
-                "max_concurrent_ffmpeg": int(vals[54] or 1),
-                "max_concurrent_media_probe": int(vals[55] or 1),
-                "resource_wait_timeout": int(vals[56] or 0),
-                "worker_detached": bool(vals[57]),
+                "youtube_title_template": vals[52],
+                "youtube_title_max_chars": int(vals[53] or 100),
+                "youtube_description": vals[54],
+                "max_concurrent_external_api": int(vals[55] or 1),
+                "max_concurrent_ffmpeg": int(vals[56] or 1),
+                "max_concurrent_media_probe": int(vals[57] or 1),
+                "resource_wait_timeout": int(vals[58] or 0),
+                "worker_detached": bool(vals[59]),
             }
             return _save_settings(data)
 

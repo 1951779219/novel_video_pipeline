@@ -15,12 +15,21 @@ JOBS_DIR.mkdir(exist_ok=True)
 PROFILES_DIR.mkdir(exist_ok=True)
 
 
+SETTINGS_SCHEMA_VERSION = 2
+DEFAULT_YOUTUBE_TITLE_TEMPLATE = "💥【爆款短文】《{title}》{intro} #小说 #推文"
+DEFAULT_YOUTUBE_DESCRIPTION = (
+    "原创内容，只只推文，每天更新高分又好看的#AI漫画#小说推文\n"
+    "💖感谢您的订阅👉小伙伴想看完整版，欢迎催更"
+)
+
+
 DEFAULT_SETTINGS: dict[str, Any] = {
+    "settings_schema_version": SETTINGS_SCHEMA_VERSION,
     "active_profile": "配置1",
 
     # 爬取
     "scraper_site": "qingtian",
-    "scraper_max_chars": 8000,
+    "scraper_max_chars": 0,
     "scraper_chapter_limit": 0,
     "source_base_url": "https://v1.gyks.cf",
     "source_platform": "番茄",
@@ -188,13 +197,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "upload_enabled": False,
     "youtube_upload_method": "browser",
     "youtube_visibility": "PRIVATE",
-    "youtube_title_template": "{short_title}｜{title} #小说推文 #一口气看完 #爽文",
-    "youtube_description": (
-        "{short_title}\n\n"
-        "书名：{title}\n"
-        "{intro}\n\n"
-        "#小说推文 #一口气看完 #爽文 #网文"
-    ),
+    "youtube_title_template": DEFAULT_YOUTUBE_TITLE_TEMPLATE,
+    "youtube_title_max_chars": 100,
+    "youtube_description": DEFAULT_YOUTUBE_DESCRIPTION,
     "youtube_tags": "",
     "browser_flow": "simple",
     "browser_upload_policy": "BTRA",
@@ -203,6 +208,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "browser_auto_restart": True,
     "browser_stall_timeout_min": 10,
     "browser_op_speed": "normal",
+    "upload_dependency_check_before_upload": True,
     "browser_profiles": json.dumps(
         [
             {
@@ -232,6 +238,49 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _looks_like_legacy_title_template(value: Any) -> bool:
+    text = str(value or "")
+    return (
+        not text.strip()
+        or "#爽文" in text
+        or "#一口气看完" in text
+        or "#灏忚" in text
+        or "{short_title}" in text
+    )
+
+
+def _looks_like_legacy_description(value: Any) -> bool:
+    text = str(value or "")
+    return (
+        not text.strip()
+        or "{short_title}" in text
+        or "{intro}" in text
+        or "#爽文" in text
+        or "#灏忚" in text
+        or "涔﹀悕" in text
+    )
+
+
+def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None = None) -> None:
+    saved = saved or {}
+    saved_version = _to_int(saved.get("settings_schema_version"), 0)
+    if saved_version < SETTINGS_SCHEMA_VERSION:
+        if _to_int(data.get("scraper_max_chars"), 0) == 8000:
+            data["scraper_max_chars"] = 0
+        if _looks_like_legacy_title_template(data.get("youtube_title_template")):
+            data["youtube_title_template"] = DEFAULT_YOUTUBE_TITLE_TEMPLATE
+        if _looks_like_legacy_description(data.get("youtube_description")):
+            data["youtube_description"] = DEFAULT_YOUTUBE_DESCRIPTION
+    data["settings_schema_version"] = SETTINGS_SCHEMA_VERSION
+
+
 class Config:
     def __init__(self):
         self._data = dict(DEFAULT_SETTINGS)
@@ -243,6 +292,7 @@ class Config:
                 saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
                 for k, v in saved.items():
                     self._data[k] = v
+                _apply_compat_migrations(self._data, saved)
             except Exception:
                 pass
 
@@ -281,6 +331,7 @@ class Config:
             saved = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(saved, dict):
                 data.update(saved)
+                _apply_compat_migrations(data, saved)
         data["active_profile"] = cleaned
         self._data = data
         return cleaned

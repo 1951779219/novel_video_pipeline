@@ -408,7 +408,8 @@ class PipelineGUI:
         combo("上传方案", "browser_active_profile", _upload_profile_names(), str(config.get("browser_active_profile", "无创收精简流程")))
         combo("上传流程", "browser_flow", ["simple", "full"], "simple")
         combo("公开范围", "youtube_visibility", ["PRIVATE", "UNLISTED", "PUBLIC"], "PRIVATE")
-        row("上传标题模板", "youtube_title_template", "{short_title}｜{title}")
+        row("上传标题模板", "youtube_title_template", "💥【爆款短文】《{title}》{intro} #小说 #推文")
+        row("上传标题字数", "youtube_title_max_chars", "100")
         textrow("说明模板", "youtube_description", "", height=4)
         row("固定 Tags", "youtube_tags", "")
         row("上传政策", "browser_upload_policy", "BTRA")
@@ -433,7 +434,7 @@ class PipelineGUI:
             "cover_width", "cover_height", "cover_title_size",
             "video_subtitle_size", "video_subtitle_margin_v", "video_subtitle_margin_lr",
             "video_subtitle_chars_per_line", "video_subtitle_max_lines",
-            "short_title_min_chars", "short_title_max_chars",
+            "short_title_min_chars", "short_title_max_chars", "youtube_title_max_chars",
         }
         float_keys = {
             "tts_volume", "pacing_seconds_per_image", "video_motion_cycle_seconds",

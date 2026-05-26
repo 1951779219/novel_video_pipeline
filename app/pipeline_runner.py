@@ -1216,6 +1216,90 @@ def _format_template(template: str, context: dict, fallback: str = "") -> str:
         return text or fallback
 
 
+def _limit_upload_title(text: str, max_chars: int = 100) -> str:
+    title = re.sub(r"\s+", " ", str(text or "")).strip()
+    limit = max(0, int(max_chars or 0))
+    if not limit or len(title) <= limit:
+        return title
+    for suffix in (" #小说 #推文", "#小说 #推文"):
+        if title.endswith(suffix) and limit > len(suffix) + 8:
+            body = title[: limit - len(suffix)].rstrip(" ，。！？、,.!?;；:")
+            return (body + suffix).strip()
+    return title[:limit].rstrip(" ，。！？、,.!?;；:")
+
+
+def _upload_lock_path() -> Path:
+    return JOBS_DIR.parent / "upload.lock"
+
+
+def _read_upload_lock(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _acquire_upload_lock(job_dir: Path, on_log: LogFn = _noop) -> Path:
+    path = _upload_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "job_id": job_dir.name,
+        "pid": os.getpid(),
+        "created_at": time.time(),
+        "created_at_text": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    last_log = 0.0
+    while True:
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            on_log(f"  upload queue acquired by {job_dir.name}")
+            return path
+        except FileExistsError:
+            info = _read_upload_lock(path)
+            pid = int(info.get("pid") or 0)
+            age = time.time() - float(info.get("created_at") or 0)
+            if (pid and not pid_alive(pid)) or age > 12 * 3600:
+                try:
+                    path.unlink()
+                    on_log("  WARN removed stale upload queue lock")
+                    continue
+                except FileNotFoundError:
+                    continue
+                except Exception:
+                    pass
+            now = time.monotonic()
+            if now - last_log >= 60:
+                owner = info.get("job_id") or "another job"
+                on_log(f"  upload queue busy: waiting for {owner} to finish")
+                last_log = now
+            time.sleep(5)
+
+
+def _release_upload_lock(path: Path, job_id: str) -> None:
+    info = _read_upload_lock(path)
+    if info.get("job_id") not in {"", None, job_id}:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _ensure_upload_dependencies(on_log: LogFn = _noop) -> None:
+    if not bool(config.get("upload_dependency_check_before_upload", True)):
+        return
+    from app.dependency_manager import ensure_dependencies
+
+    on_log("  checking upload dependencies before YouTube upload")
+    report = ensure_dependencies(scope="full", on_log=lambda line: on_log(f"  {line}"))
+    if not bool(report.get("ok")):
+        summary = str(report.get("summary") or "upload dependencies are not ready")
+        raise RuntimeError(f"YouTube upload dependencies are not ready: {summary}")
+
+
 def _cover_provider() -> str:
     provider = str(config.get("cover_provider", "same_as_image") or "").strip()
     if provider in {"", "same_as_image", "同配图", "同图片"}:
@@ -1789,8 +1873,6 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
     if str(config.youtube_upload_method or "browser").lower() != "browser":
         on_log("  WARN only browser upload is wired in this build")
         return ""
-    from app.upload import upload_to_youtube
-
     metadata = metadata or {}
     context = {
         "title": title,
@@ -1809,26 +1891,36 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
     ad_interval = int(profile.get("ad_interval") or config.browser_ad_interval or 60)
     ad_start = int(profile.get("ad_start") or config.browser_ad_start or 0)
 
-    upload_title = _format_template(title_template, context, fallback=title).strip() or title
+    upload_title = _limit_upload_title(
+        _format_template(title_template, context, fallback=title),
+        int(config.get("youtube_title_max_chars", 100) or 100),
+    ) or title
     upload_description = _format_template(description_template, context, fallback="")
     on_log(f"[7/7] YouTube browser upload: {upload_title}")
     on_log(f"  upload profile={profile.get('name', '-') or '-'} flow={'精简' if flow == 'simple' else '完整'}")
-    video_id = upload_to_youtube(
-        video,
-        upload_title,
-        description=upload_description,
-        visibility=visibility,
-        cover_path=cover if cover and cover.exists() else None,
-        flow=flow,
-        upload_policy=upload_policy,
-        ad_interval=ad_interval,
-        ad_start=ad_start,
-        auto_restart=bool(config.browser_auto_restart),
-        stall_timeout_min=int(config.browser_stall_timeout_min or 10),
-        op_speed=str(config.browser_op_speed or "normal"),
-        on_log=on_log,
-        on_progress=lambda p: write_status(job_dir, stage="upload", upload_progress=float(p or 0)),
-    )
+    lock_path = _acquire_upload_lock(job_dir, on_log)
+    try:
+        _ensure_upload_dependencies(on_log)
+        from app.upload import upload_to_youtube
+
+        video_id = upload_to_youtube(
+            video,
+            upload_title,
+            description=upload_description,
+            visibility=visibility,
+            cover_path=cover if cover and cover.exists() else None,
+            flow=flow,
+            upload_policy=upload_policy,
+            ad_interval=ad_interval,
+            ad_start=ad_start,
+            auto_restart=bool(config.browser_auto_restart),
+            stall_timeout_min=int(config.browser_stall_timeout_min or 10),
+            op_speed=str(config.browser_op_speed or "normal"),
+            on_log=on_log,
+            on_progress=lambda p: write_status(job_dir, stage="upload", upload_progress=float(p or 0)),
+        )
+    finally:
+        _release_upload_lock(lock_path, job_dir.name)
     if not video_id:
         raise RuntimeError("YouTube upload failed")
     url = f"https://www.youtube.com/watch?v={video_id}"
