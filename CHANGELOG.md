@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.10
+
+- Added a configurable per-segment TTS timeout so a stuck Edge/API speech request can fail, retry, and use the existing silence fallback instead of holding the whole job indefinitely.
+- Added TTS heartbeat logs while long-running speech tasks are in progress, including which segments are still active.
+- Updated TTS progress logging to emit after every completed segment so the desktop GUI and WebUI keep showing movement during long narration jobs.
+- Exposed the TTS timeout and heartbeat settings in the desktop GUI and WebUI.
+
 ## v1.0.9
 
 - Added `max_concurrent_jobs` configuration (default 2) to control how many worker processes may run simultaneously, preventing resource exhaustion while allowing parallel processing.

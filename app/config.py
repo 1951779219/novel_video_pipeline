@@ -91,6 +91,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "tts_retries": 3,
     "tts_fail_silence": True,
     "tts_emotion": "",
+    "tts_segment_timeout_seconds": 180,
+    "tts_heartbeat_seconds": 30,
 
     # Image
     "image_provider": "comfyui",  # comfyui / sdwebui / openai / replicate / aliyun / custom

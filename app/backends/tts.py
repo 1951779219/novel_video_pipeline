@@ -27,6 +27,7 @@ class TTSBackend:
         self.base_url = base_url.rstrip("/") if base_url else ""
         self.extra = extra or {}
         self.volume = _volume_multiplier(volume)
+        self.timeout_seconds = _timeout_seconds(self.extra.get("timeout_seconds"), 180.0)
 
     def synth(self, text: str, out_path: Path) -> float:
         """合成音频写入 out_path（mp3 或 wav），返回时长（秒）。"""
@@ -74,7 +75,7 @@ class TTSBackend:
         import edge_tts
         async def _run():
             comm = edge_tts.Communicate(text, voice=self.voice, rate=self.rate)
-            await comm.save(str(out_path))
+            await asyncio.wait_for(comm.save(str(out_path)), timeout=self.timeout_seconds)
         asyncio.run(_run())
 
     # ── voicevox（本地） ─────────────────────────────────
@@ -82,12 +83,12 @@ class TTSBackend:
         base = self.base_url or "http://127.0.0.1:50021"
         speaker = int(self.voice) if str(self.voice).isdigit() else 1
         # 1) audio_query
-        q = httpx.post(f"{base}/audio_query", params={"text": text, "speaker": speaker}, timeout=60.0)
+        q = httpx.post(f"{base}/audio_query", params={"text": text, "speaker": speaker}, timeout=min(60.0, self.timeout_seconds))
         q.raise_for_status()
         # 2) synthesis
         s = httpx.post(f"{base}/synthesis", params={"speaker": speaker},
                        headers={"Content-Type": "application/json"},
-                       content=q.content, timeout=120.0)
+                       content=q.content, timeout=self.timeout_seconds)
         s.raise_for_status()
         out_path.write_bytes(s.content)
 
@@ -105,7 +106,7 @@ class TTSBackend:
         instructions = self.extra.get("instructions") or self.extra.get("emotion") or ""
         if instructions:
             payload["instructions"] = str(instructions)
-        r = httpx.post(url, json=payload, headers=headers, timeout=120.0)
+        r = httpx.post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
         r.raise_for_status()
         out_path.write_bytes(r.content)
 
@@ -123,7 +124,7 @@ class TTSBackend:
             "Content-Type": "application/ssml+xml",
             "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
         }
-        r = httpx.post(url, content=ssml.encode("utf-8"), headers=headers, timeout=120.0)
+        r = httpx.post(url, content=ssml.encode("utf-8"), headers=headers, timeout=self.timeout_seconds)
         r.raise_for_status()
         out_path.write_bytes(r.content)
 
@@ -133,7 +134,7 @@ class TTSBackend:
         url = f"{base}/text-to-speech/{self.voice}"
         headers = {"xi-api-key": self.api_key, "Content-Type": "application/json"}
         payload = {"text": text, "model_id": self.extra.get("model", "eleven_multilingual_v2")}
-        r = httpx.post(url, json=payload, headers=headers, timeout=120.0)
+        r = httpx.post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
         r.raise_for_status()
         out_path.write_bytes(r.content)
 
@@ -187,6 +188,14 @@ def _volume_multiplier(value) -> float:
     except Exception:
         multiplier = 1.0
     return max(0.0, min(5.0, multiplier))
+
+
+def _timeout_seconds(value, default: float = 180.0) -> float:
+    try:
+        seconds = float(value if value not in (None, "") else default)
+    except Exception:
+        seconds = default
+    return max(30.0, min(1800.0, seconds))
 
 
 def _xml_escape(s: str) -> str:

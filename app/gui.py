@@ -320,6 +320,8 @@ class PipelineGUI:
         row("情感/指令", "tts_emotion", "")
         row("TTS Base URL/中转", "tts_base_url", "")
         row("TTS API Key", "tts_api_key", "")
+        row("TTS 单段超时秒", "tts_segment_timeout_seconds", "180")
+        row("TTS 心跳日志秒", "tts_heartbeat_seconds", "30")
         buttons(("检测 TTS API / 识别模型", lambda: self._probe_api("tts")))
 
         ttk.Separator(body).pack(fill=tk.X, pady=8)
@@ -427,7 +429,7 @@ class PipelineGUI:
         int_keys = {
             "pacing_fixed_count", "video_width", "video_height", "video_fps",
             "video_encoder_quality", "ai_text_clean_batch_chars",
-            "image_api_timeout_seconds",
+            "image_api_timeout_seconds", "tts_segment_timeout_seconds", "tts_heartbeat_seconds",
             "max_concurrent_external_api", "max_concurrent_ffmpeg",
             "max_parallel_tts", "max_parallel_images", "max_parallel_video_clips",
             "browser_ad_interval", "browser_ad_start", "dependency_pip_timeout_seconds",

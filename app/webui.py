@@ -188,6 +188,8 @@ def build_config_tab():
             with gr.Row():
                 tts_retries = gr.Number(value=config.tts_retries, label="TTS 重试次数", precision=0)
                 tts_fail_silence = gr.Checkbox(value=config.tts_fail_silence, label="TTS 失败后用静音占位")
+                tts_segment_timeout_seconds = gr.Number(value=config.get("tts_segment_timeout_seconds", 180), label="TTS segment timeout seconds", precision=0)
+                tts_heartbeat_seconds = gr.Number(value=config.get("tts_heartbeat_seconds", 30), label="TTS heartbeat seconds", precision=0)
             tts_extra_json = gr.Textbox(value=json.dumps(config.tts_extra or {}, ensure_ascii=False), label="额外参数 JSON")
             voice_quick.change(lambda v: v, [voice_quick], [tts_voice])
 
@@ -309,6 +311,8 @@ def build_config_tab():
             max_concurrent_media_probe,
             resource_wait_timeout,
             worker_detached,
+            tts_segment_timeout_seconds,
+            tts_heartbeat_seconds,
         ]
 
         def _save(*vals):
@@ -377,6 +381,8 @@ def build_config_tab():
                 "max_concurrent_media_probe": int(vals[57] or 1),
                 "resource_wait_timeout": int(vals[58] or 0),
                 "worker_detached": bool(vals[59]),
+                "tts_segment_timeout_seconds": int(vals[60] or 180),
+                "tts_heartbeat_seconds": int(vals[61] or 30),
             }
             return _save_settings(data)
 

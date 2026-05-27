@@ -17,7 +17,7 @@ import sys
 import time
 import traceback
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict
 from pathlib import Path
 from typing import Callable, Iterable
@@ -816,7 +816,12 @@ def _stage_tts_manifest_impl(
             rate=config.tts_rate,
             api_key=config.tts_api_key,
             base_url=config.tts_base_url,
-            extra={**(config.tts_extra or {}), "emotion": config.tts_emotion, "model": config.get("tts_model", "tts-1")},
+            extra={
+                **(config.tts_extra or {}),
+                "emotion": config.tts_emotion,
+                "model": config.get("tts_model", "tts-1"),
+                "timeout_seconds": config.get("tts_segment_timeout_seconds", 180),
+            },
             volume=config.get("tts_volume", 1.0),
         )
 
@@ -841,10 +846,38 @@ def _stage_tts_manifest_impl(
     audios: list[Path | None] = [None] * len(segments)
     durations: list[float] = [0.0] * len(segments)
     retries = max(1, int(config.tts_retries))
+    try:
+        heartbeat_seconds = float(config.get("tts_heartbeat_seconds", 30) or 30)
+    except Exception:
+        heartbeat_seconds = 30.0
+    heartbeat_seconds = max(10.0, min(300.0, heartbeat_seconds))
+    running_lock = threading.Lock()
+    running_segments: dict[int, dict[str, float | int]] = {}
 
     def set_manifest(entry: dict) -> None:
         with manifest_lock:
             _set_tts_manifest_entry(manifest_path, manifest, entry)
+
+    def mark_running(index: int, attempt: int) -> None:
+        with running_lock:
+            running_segments[index] = {"attempt": attempt, "started": time.monotonic()}
+
+    def clear_running(index: int) -> None:
+        with running_lock:
+            running_segments.pop(index, None)
+
+    def running_summary() -> str:
+        with running_lock:
+            items = sorted(running_segments.items())
+        if not items:
+            return "waiting for an API slot or finishing cached audio"
+        parts = []
+        now = time.monotonic()
+        for index, info in items[:4]:
+            elapsed = max(0.0, now - float(info.get("started") or now))
+            parts.append(f"seg{index} attempt {int(info.get('attempt') or 1)} {elapsed:.0f}s")
+        extra = "" if len(items) <= 4 else f", +{len(items) - 4} more"
+        return ", ".join(parts) + extra
 
     def process_segment(i: int, seg: Segment) -> tuple[int, Path, float]:
         out = audio_dir / f"seg_{i:05d}.mp3"
@@ -882,13 +915,17 @@ def _stage_tts_manifest_impl(
                             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                         },
                     )
-                    with external_api_slot(action=f"tts {i + 1}/{len(segments)}"):
-                        d = tts.synth(seg.text, tmp)
-                    if d <= 0.05:
-                        raise RuntimeError("audio duration is zero")
-                    tmp.replace(out)
-                    set_manifest(_ready_tts_entry(i, seg, out, d, expected))
-                    break
+                    mark_running(i, attempt)
+                    try:
+                        with external_api_slot(action=f"tts {i + 1}/{len(segments)}"):
+                            d = tts.synth(seg.text, tmp)
+                        if d <= 0.05:
+                            raise RuntimeError("audio duration is zero")
+                        tmp.replace(out)
+                        set_manifest(_ready_tts_entry(i, seg, out, d, expected))
+                        break
+                    finally:
+                        clear_running(i)
                 except Exception as exc:
                     tmp.unlink(missing_ok=True)
                     set_manifest(
@@ -904,7 +941,7 @@ def _stage_tts_manifest_impl(
                     )
                     on_log(f"  WARN seg{i} TTS failed {attempt}/{retries}: {exc}")
                     if attempt < retries:
-                        on_log(f"    ↻ TTS seg{i} 重试中 (第 {attempt + 1}/{retries} 次)...")
+                        on_log(f"    TTS seg{i} retrying ({attempt + 1}/{retries})...")
                         time.sleep(min(8, attempt * 1.5))
             if d <= 0.05 and config.tts_fail_silence:
                 d = _estimated_speech_duration(seg.text)
@@ -917,28 +954,22 @@ def _stage_tts_manifest_impl(
         return i, out, d
 
     completed = 0
-    if workers == 1:
-        iterator = (process_segment(i, seg) for i, seg in enumerate(segments))
-        for i, out, d in iterator:
-            audios[i] = out
-            durations[i] = d
-            completed += 1
-            if completed % 5 == 0 or completed == len(segments):
-                _write_json(job_dir / "durations.json", durations)
-                on_log(f"  [{completed}/{len(segments)}] total {sum(durations):.1f}s")
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tts") as pool:
+        pending = {pool.submit(process_segment, i, seg) for i, seg in enumerate(segments)}
+        while pending:
+            done, pending = wait(pending, timeout=heartbeat_seconds, return_when=FIRST_COMPLETED)
+            if not done:
+                on_log(f"  TTS still running: {running_summary()} ({completed}/{len(segments)} done)")
                 on_prog(completed / max(1, len(segments)))
-    else:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tts") as pool:
-            futures = [pool.submit(process_segment, i, seg) for i, seg in enumerate(segments)]
-            for future in as_completed(futures):
+                continue
+            for future in done:
                 i, out, d = future.result()
                 audios[i] = out
                 durations[i] = d
                 completed += 1
-                if completed % 5 == 0 or completed == len(segments):
-                    _write_json(job_dir / "durations.json", durations)
-                    on_log(f"  [{completed}/{len(segments)}] total {sum(durations):.1f}s")
-                    on_prog(completed / max(1, len(segments)))
+                _write_json(job_dir / "durations.json", durations)
+                on_log(f"  TTS progress {completed}/{len(segments)}: seg{i} {d:.1f}s, total {sum(durations):.1f}s")
+                on_prog(completed / max(1, len(segments)))
 
     final_audios = [p for p in audios if p is not None]
     if len(final_audios) != len(segments):
