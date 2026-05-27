@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.11
+
+- Changed default image and video dimensions to 16:9 landscape (`1920x1080`) and migrates the old `1080x1920` defaults.
+- Added policy-safe image prompt rewriting and safer retry prompts to reduce content-policy failures from violent, sexual, or graphic story text.
+- Updated image progress logging to emit per completed image plus heartbeat logs while image requests are still running.
+- Removed trailing author/source parentheses from cover and YouTube upload titles by using a clean public title.
+- Auto-starts the next queued task when a worker completes successfully and capacity is available.
+
 ## v1.0.10
 
 - Added a configurable per-segment TTS timeout so a stuck Edge/API speech request can fail, retry, and use the existing silence fallback instead of holding the whole job indefinitely.

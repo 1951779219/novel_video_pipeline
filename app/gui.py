@@ -362,8 +362,8 @@ class PipelineGUI:
         combo("配图模式", "pacing_mode", ["by_duration", "by_sentence", "by_paragraph", "fixed_count"], "by_duration")
         row("每张图秒数", "pacing_seconds_per_image", "6")
         row("固定图片数", "pacing_fixed_count", "10")
-        row("视频宽", "video_width", "1080")
-        row("视频高", "video_height", "1920")
+        row("视频宽", "video_width", "1920")
+        row("视频高", "video_height", "1080")
         row("FPS", "video_fps", "30")
         combo("视频编码器", "video_encoder", ["libx264", "h264_nvenc", "h264_qsv", "h264_amf"], "libx264")
         row("编码预设", "video_encoder_preset", "veryfast")
@@ -410,7 +410,7 @@ class PipelineGUI:
         combo("上传方案", "browser_active_profile", _upload_profile_names(), str(config.get("browser_active_profile", "无创收精简流程")))
         combo("上传流程", "browser_flow", ["simple", "full"], "simple")
         combo("公开范围", "youtube_visibility", ["PRIVATE", "UNLISTED", "PUBLIC"], "PRIVATE")
-        row("上传标题模板", "youtube_title_template", "💥【爆款短文】《{title}》{intro} #小说 #推文")
+        row("上传标题模板", "youtube_title_template", "💥【爆款短文】《{clean_title}》{intro} #小说 #推文")
         row("上传标题字数", "youtube_title_max_chars", "100")
         textrow("说明模板", "youtube_description", "", height=4)
         row("固定 Tags", "youtube_tags", "")
@@ -420,7 +420,7 @@ class PipelineGUI:
 
         ttk.Label(
             body,
-            text="上传标题可用：{title}=原标题，{short_title}=短说明标题。simple=无创收精简流程，full=完整创收/广告/分级流程。",
+            text="上传标题可用：{clean_title}=去作者名书名，{title}=原标题，{short_title}=短说明标题。simple=无创收精简流程，full=完整创收/广告/分级流程。",
             foreground="#666",
             wraplength=520,
         ).pack(anchor=tk.W, pady=(4, 14))

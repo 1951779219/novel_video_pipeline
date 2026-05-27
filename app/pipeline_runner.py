@@ -403,6 +403,34 @@ def start_worker(input_text: str, job_id: str | None = None, resume: bool = Fals
     return job_id, int(process.pid)
 
 
+def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = _noop) -> tuple[str, int] | None:
+    """Start the next waiting job when worker capacity is available."""
+    max_jobs = max(1, int(config.get("max_concurrent_jobs", 2)))
+    if count_running_workers() >= max_jobs:
+        return None
+    for row in list_jobs(limit=500):
+        job_id = str(row.get("job_id") or "")
+        if not job_id or job_id == exclude_job_id:
+            continue
+        st = load_status(job_id)
+        if st.get("worker_alive") or st.get("stage") not in {"queued", "stopped"}:
+            continue
+        input_text = str(st.get("input") or "")
+        if not input_text:
+            continue
+        try:
+            started = start_worker(input_text, job_id=job_id, resume=True)
+            on_log(f"  auto-started waiting job {job_id} pid={started[1]}")
+            return started
+        except RuntimeError:
+            return None
+        except Exception as exc:
+            append_log(job_dir_for(job_id), f"auto-start failed: {exc}")
+            on_log(f"  WARN auto-start waiting job {job_id} failed: {exc}")
+            return None
+    return None
+
+
 def _build_scraper(site: str):
     if site == "syosetu":
         return SyosetuScraper()
@@ -1055,6 +1083,55 @@ def stage_pacing(
     return plans
 
 
+_POLICY_REPLACEMENTS = [
+    (r"\b(severed limbs?|dismember(?:ed|ment)?|guts?|corpse|corpses|dead bod(?:y|ies)|rivers? of blood)\b", "dramatic aftermath implied by scattered shadows"),
+    (r"\b(bloody|blood-soaked|blood splatter|gore|graphic violence|massacre)\b", "tense dramatic atmosphere"),
+    (r"\b(kill(?:ing)?|murder(?:ing)?|slaughter(?:ing)?|stab(?:bing|bed)?|tortur(?:e|ing)|behead(?:ing|ed)?)\b", "confronting in a tense scene"),
+    (r"\b(nude|naked|sexual|erotic|seductive|intimate bed scene|rape|assault)\b", "emotional conflict"),
+    (r"\b(teenage boy|teenage girl|schoolboy|schoolgirl|minor child|underage)\b", "young adult"),
+    (r"\b(sword through|pinned by a sword|knife at|gun at|weapon close-up)\b", "symbolic confrontation"),
+    (r"\b(victim|body|bodies)\b", "character"),
+]
+
+
+def _policy_safe_image_prompt(prompt: str, *, fallback_text: str = "") -> str:
+    value = " ".join(str(prompt or fallback_text or "").split()).strip()
+    if not value:
+        value = "Cinematic anime illustration of a tense emotional novel scene, expressive faces, soft lighting"
+    for pattern, replacement in _POLICY_REPLACEMENTS:
+        value = re.sub(pattern, replacement, value, flags=re.I)
+    value = re.sub(r"(?i)\b(blood|gore|corpse|nude|naked|sexual|erotic|severed)\b", "", value)
+    value = re.sub(r"\s{2,}", " ", value).strip(" ,.;")
+    guard = (
+        "Family-friendly cinematic anime illustration, adult-looking characters, symbolic emotional drama, "
+        "fully clothed characters, clean composition, soft lighting, readable faces, text-free artwork"
+    )
+    if "family-friendly" not in value.lower():
+        value = f"{value}. {guard}"
+    return value[:1400]
+
+
+def _is_image_policy_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        item in text
+        for item in (
+            "content policy",
+            "policy",
+            "safety",
+            "防护",
+            "违反",
+            "裸露",
+            "色情",
+            "情色",
+            "暴力",
+            "no b64_json/url",
+            "can't generate",
+            "cannot generate",
+        )
+    )
+
+
 def stage_storyboard_and_image(
     plans: list[ImagePlan],
     job_dir: Path,
@@ -1094,7 +1171,7 @@ def stage_storyboard_and_image(
 
     def process_image(i: int, plan: ImagePlan) -> tuple[int, Path, str]:
         out = img_dir / f"img_{i:05d}.png"
-        prompt = _prompt_for_plan(make_llm(), plan, on_log, i)
+        prompt = _policy_safe_image_prompt(_prompt_for_plan(make_llm(), plan, on_log, i), fallback_text=plan.text)
         prompts_log[i] = {"index": i, "text": plan.text, "prompt": prompt}
         if not out.exists() or out.stat().st_size < 100:
             last_exc: Exception | None = None
@@ -1105,9 +1182,18 @@ def stage_storyboard_and_image(
                         f"base={config.image_base_url or '-'} model={config.image_model or '-'} "
                         f"size={config.image_width}x{config.image_height} attempt={attempt}"
                     )
+                    attempt_prompt = prompt
+                    if attempt > 1 and last_exc is not None and _is_image_policy_error(last_exc):
+                        attempt_prompt = _policy_safe_image_prompt(
+                            "A calm symbolic scene showing the same story mood through facial expressions, "
+                            "distance, lighting, and environment; no direct harm or explicit content.",
+                            fallback_text=plan.text,
+                        )
+                        prompts_log[i] = {"index": i, "text": plan.text, "prompt": attempt_prompt, "safe_retry": True}
+                        on_log(f"  image {i + 1}/{len(plans)} retry with safer prompt")
                     if config.image_provider == "placeholder":
                         make_image_backend("placeholder").generate(
-                            prompt,
+                            attempt_prompt,
                             config.llm_negative_prompt,
                             out,
                             width=config.image_width,
@@ -1116,7 +1202,7 @@ def stage_storyboard_and_image(
                     else:
                         with external_api_slot(action=f"image {i + 1}/{len(plans)}"):
                             make_image_backend().generate(
-                                prompt,
+                                attempt_prompt,
                                 config.llm_negative_prompt,
                                 out,
                                 width=config.image_width,
@@ -1130,7 +1216,7 @@ def stage_storyboard_and_image(
             if not out.exists() or out.stat().st_size < 100:
                 on_log(f"  WARN 图{i} 改用占位图: {last_exc}")
                 make_image_backend("placeholder").generate(
-                    prompt,
+                    _policy_safe_image_prompt(prompt, fallback_text=plan.text),
                     "",
                     out,
                     width=config.image_width,
@@ -1141,28 +1227,25 @@ def stage_storyboard_and_image(
         return i, out, prompt
 
     completed = 0
-    if workers == 1:
-        iterator = (process_image(i, plan) for i, plan in enumerate(plans))
-        for i, out, prompt in iterator:
-            paths[i] = out
-            completed += 1
-            if completed % 5 == 0 or completed == len(plans):
-                with write_lock:
-                    _write_json(job_dir / "prompts.json", [p for p in prompts_log if p is not None])
-                on_log(f"  [{completed}/{len(plans)}] {prompt[:80]}...")
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image") as pool:
+        future_labels = {pool.submit(process_image, i, plan): i for i, plan in enumerate(plans)}
+        pending = set(future_labels)
+        while pending:
+            done, pending = wait(pending, timeout=30.0, return_when=FIRST_COMPLETED)
+            if not done:
+                waiting = ", ".join(f"image {future_labels[f] + 1}" for f in list(pending)[:4])
+                more = "" if len(pending) <= 4 else f", +{len(pending) - 4} more"
+                on_log(f"  image still running: {waiting}{more} ({completed}/{len(plans)} done)")
                 on_prog(completed / max(1, len(plans)))
-    else:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image") as pool:
-            futures = [pool.submit(process_image, i, plan) for i, plan in enumerate(plans)]
-            for future in as_completed(futures):
+                continue
+            for future in done:
                 i, out, prompt = future.result()
                 paths[i] = out
                 completed += 1
-                if completed % 5 == 0 or completed == len(plans):
-                    with write_lock:
-                        _write_json(job_dir / "prompts.json", [p for p in prompts_log if p is not None])
-                    on_log(f"  [{completed}/{len(plans)}] {prompt[:80]}...")
-                    on_prog(completed / max(1, len(plans)))
+                with write_lock:
+                    _write_json(job_dir / "prompts.json", [p for p in prompts_log if p is not None])
+                on_log(f"  image progress {completed}/{len(plans)}: {prompt[:80]}...")
+                on_prog(completed / max(1, len(plans)))
 
     final_paths = [p for p in paths if p is not None]
     if len(final_paths) != len(plans):
@@ -1184,6 +1267,19 @@ def _metadata_intro(novel: Novel, limit: int = 700) -> str:
     return joined[:limit]
 
 
+_AUTHOR_SUFFIX_RE = re.compile(r"\s*[\(（【\[][^()（）【】\[\]]{1,24}[\)）】\]]\s*$")
+
+
+def _clean_display_title(title: str) -> str:
+    """Remove trailing author/source hints such as `Title(author)` from public titles."""
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    previous = None
+    while value and value != previous:
+        previous = value
+        value = _AUTHOR_SUFFIX_RE.sub("", value).strip()
+    return value or str(title or "").strip() or "Untitled"
+
+
 def _clean_short_title(text: str, min_chars: int, max_chars: int) -> str:
     value = html.unescape(str(text or ""))
     value = re.sub(r"[《》“”\"'`#【】\[\]（）()]", "", value)
@@ -1200,7 +1296,7 @@ def _fallback_short_title(novel: Novel, intro: str, min_chars: int, max_chars: i
     text = re.sub(r"\s+", "", intro or novel.full_text or novel.title or "")
     text = re.sub(r"^(简介|内容简介|小说简介|作品简介|书籍简介)[:：]?", "", text)
     text = re.sub(r"[《》“”\"'`#【】\[\]（）()]", "", text)
-    title = re.sub(r"\s+", "", novel.title or "")
+    title = re.sub(r"\s+", "", _clean_display_title(novel.title))
     if title and text.startswith(title):
         text = text[len(title):]
     parts = re.split(r"[。！？!?；;]", text)
@@ -1221,6 +1317,7 @@ def _fallback_short_title(novel: Novel, intro: str, min_chars: int, max_chars: i
 
 def stage_metadata(novel: Novel, job_dir: Path, on_log: LogFn = _noop) -> dict:
     intro = _metadata_intro(novel)
+    clean_title = _clean_display_title(novel.title)
     min_chars = max(6, int(config.get("short_title_min_chars", 20) or 20))
     max_chars = max(min_chars, int(config.get("short_title_max_chars", 30) or 30))
     short_title = ""
@@ -1235,7 +1332,7 @@ def stage_metadata(novel: Novel, job_dir: Path, on_log: LogFn = _noop) -> dict:
                     system_prompt=str(config.get("short_title_prompt", "") or ""),
                     style_suffix="",
                 )
-                request = f"书名：{novel.title}\n简介：{intro[:900]}\n只输出短说明标题。"
+                request = f"书名：{clean_title}\n简介：{intro[:900]}\n只输出短说明标题。"
                 with external_api_slot(action="short title"):
                     short_title = _clean_short_title(llm.storyboard(request), min_chars, max_chars)
             except Exception as exc:
@@ -1244,6 +1341,7 @@ def stage_metadata(novel: Novel, job_dir: Path, on_log: LogFn = _noop) -> dict:
             short_title = _fallback_short_title(novel, intro, min_chars, max_chars)
     metadata = {
         "title": novel.title,
+        "clean_title": clean_title,
         "short_title": short_title,
         "intro": intro,
         "author": novel.author,
@@ -1377,7 +1475,7 @@ def _cover_excerpt(novel: Novel, segments: list[Segment], limit: int = 900) -> s
 
 
 def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _noop) -> str:
-    title = (novel.title or "Untitled").strip()
+    title = _clean_display_title(novel.title)
     excerpt = _cover_excerpt(novel, segments)
     style = str(config.llm_image_style_suffix or "").strip()
     fallback_template = str(config.get("cover_prompt_template", "") or "")
@@ -1395,7 +1493,8 @@ def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _
             cover_system = (
                 "You write one concise English image-generation prompt for a long-form novel recap cover. "
                 "Use the title as fixed story context. Do not ask the image model to render any title, words, "
-                "logos, captions, UI, or watermarks. Ask for clean darker visual space at the bottom where "
+                "logos, captions, UI, or watermarks. Keep the scene policy-safe: no gore, blood, corpse, "
+                "nudity, sexual content, weapon close-ups, or explicit violence. Ask for clean darker visual space at the bottom where "
                 "the video editor will overlay the exact title."
             )
             llm = LLMBackend(
@@ -1416,13 +1515,14 @@ def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _
                 prompt = llm.storyboard(request).strip()
             if title not in prompt:
                 prompt = f'Title context: "{title}". {prompt}'
-            return (
+            return _policy_safe_image_prompt(
                 f'{prompt}. Do not render any words or title text in the image; '
-                f'leave a clean darker lower band for the overlaid title "{title}".'
+                f'leave a clean darker lower band for the overlaid title "{title}".',
+                fallback_text=excerpt,
             )
         except Exception as exc:
             on_log(f"  WARN cover prompt LLM failed: {exc}; use template prompt")
-    return fallback
+    return _policy_safe_image_prompt(fallback, fallback_text=excerpt)
 
 
 def _hex_rgb(value: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -1632,7 +1732,7 @@ def stage_cover(
     if not bool(config.get("cover_enabled", True)):
         return None
 
-    title = (novel.title or "Untitled").strip()
+    title = _clean_display_title(novel.title)
     cover_dir = job_dir / "cover"
     cover_dir.mkdir(parents=True, exist_ok=True)
     raw_path = cover_dir / "cover_raw.png"
@@ -1928,8 +2028,10 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
         on_log("  WARN only browser upload is wired in this build")
         return ""
     metadata = metadata or {}
+    clean_title = str(metadata.get("clean_title") or _clean_display_title(title))
     context = {
         "title": title,
+        "clean_title": clean_title,
         "short_title": metadata.get("short_title", ""),
         "intro": metadata.get("intro", ""),
         "author": metadata.get("author", ""),
@@ -1937,7 +2039,7 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
         "job_id": job_dir.name,
     }
     profile = _active_upload_profile()
-    title_template = str(profile.get("title_template") or config.youtube_title_template or "{title}")
+    title_template = str(profile.get("title_template") or config.youtube_title_template or "{clean_title}")
     description_template = str(profile.get("description") or config.youtube_description or "")
     flow = _normalize_upload_flow(profile.get("flow") or config.browser_flow or "simple")
     visibility = str(profile.get("visibility") or config.youtube_visibility or "PRIVATE").strip().upper()
@@ -1946,9 +2048,9 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
     ad_start = int(profile.get("ad_start") or config.browser_ad_start or 0)
 
     upload_title = _limit_upload_title(
-        _format_template(title_template, context, fallback=title),
+        _format_template(title_template, context, fallback=clean_title),
         int(config.get("youtube_title_max_chars", 100) or 100),
-    ) or title
+    ) or clean_title
     upload_description = _format_template(description_template, context, fallback="")
     on_log(f"[7/7] YouTube browser upload: {upload_title}")
     on_log(f"  upload profile={profile.get('name', '-') or '-'} flow={'精简' if flow == 'simple' else '完整'}")
@@ -2256,6 +2358,7 @@ def run_full(
             worker_pid=None,
             finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
         )
+        start_next_queued_job(exclude_job_id=job_id, on_log=log)
         return result
     except Exception as exc:
         log(f"ERROR 失败: {exc}\n{traceback.format_exc()}")
@@ -2267,10 +2370,10 @@ def _prompt_for_plan(llm: LLMBackend, plan: ImagePlan, on_log: LogFn, index: int
     if config.llm_api_key or config.llm_provider == "ollama":
         try:
             with external_api_slot(action=f"storyboard {index}"):
-                return llm.storyboard(plan.text)
+                return _policy_safe_image_prompt(llm.storyboard(plan.text), fallback_text=plan.text)
         except Exception as exc:
             on_log(f"  WARN 分镜{index} LLM 失败: {exc}，用原文兜底")
-    return plan.text[:160] + ", " + config.llm_image_style_suffix
+    return _policy_safe_image_prompt(plan.text[:160] + ", " + config.llm_image_style_suffix, fallback_text=plan.text)
 
 
 def _plan_signature(plans: list[ImagePlan]) -> list[list[int]]:

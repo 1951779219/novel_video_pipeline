@@ -15,8 +15,8 @@ JOBS_DIR.mkdir(exist_ok=True)
 PROFILES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 2
-DEFAULT_YOUTUBE_TITLE_TEMPLATE = "💥【爆款短文】《{title}》{intro} #小说 #推文"
+SETTINGS_SCHEMA_VERSION = 3
+DEFAULT_YOUTUBE_TITLE_TEMPLATE = "💥【爆款短文】《{clean_title}》{intro} #小说 #推文"
 DEFAULT_YOUTUBE_DESCRIPTION = (
     "原创内容，只只推文，每天更新高分又好看的#AI漫画#小说推文\n"
     "💖感谢您的订阅👉小伙伴想看完整版，欢迎催更"
@@ -52,14 +52,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "llm_api_key": "",
     "llm_model": "gpt-4o-mini",
     "llm_storyboard_prompt": (
-        "You are an expert at converting Japanese novel paragraphs into Stable Diffusion prompts.\n"
-        "For each input paragraph, output ONE concise English SD prompt (≤60 tokens) that captures the scene's "
-        "setting, characters, mood, lighting and key action. "
+        "You are an expert at converting novel paragraphs into safe image-generation prompts.\n"
+        "For each paragraph, output ONE concise English prompt (<=60 tokens) that captures setting, "
+        "characters, mood, lighting, and key action. Use adult-looking characters, symbolic drama, "
+        "and non-graphic emotion. Avoid gore, blood, weapons, corpses, explicit violence, nudity, "
+        "sexualized minors, abuse, self-harm, logos, watermarks, and any readable text. "
         "Use anime/illustration style by default. "
         "Output ONLY the prompt, no quotes, no numbering."
     ),
     "llm_image_style_suffix": "anime style, detailed, cinematic lighting, masterpiece",
-    "llm_negative_prompt": "lowres, bad anatomy, bad hands, text, error, missing fingers, jpeg artifacts, watermark",
+    "llm_negative_prompt": "lowres, bad anatomy, bad hands, text, error, missing fingers, jpeg artifacts, watermark, logo, words, blood, gore, corpse, severed limbs, nudity, sexual content, explicit violence, weapon close-up",
 
     # Short marketing title
     "short_title_enabled": True,
@@ -99,8 +101,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "image_base_url": "http://127.0.0.1:8188",
     "image_api_key": "",
     "image_model": "",
-    "image_width": 1080,
-    "image_height": 1920,
+    "image_width": 1920,
+    "image_height": 1080,
     "image_steps": 25,
     "image_cfg": 7.0,
     "image_api_timeout_seconds": 900,
@@ -140,8 +142,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "video_transition_duration": 0.4,
 
     # 视频
-    "video_width": 1080,
-    "video_height": 1920,
+    "video_width": 1920,
+    "video_height": 1080,
     "video_fps": 30,
     "video_encoder": "libx264",
     "video_encoder_preset": "veryfast",
@@ -277,10 +279,16 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
     if saved_version < SETTINGS_SCHEMA_VERSION:
         if _to_int(data.get("scraper_max_chars"), 0) == 8000:
             data["scraper_max_chars"] = 0
-        if _looks_like_legacy_title_template(data.get("youtube_title_template")):
+        if _looks_like_legacy_title_template(data.get("youtube_title_template")) or "{title}" in str(data.get("youtube_title_template") or ""):
             data["youtube_title_template"] = DEFAULT_YOUTUBE_TITLE_TEMPLATE
         if _looks_like_legacy_description(data.get("youtube_description")):
             data["youtube_description"] = DEFAULT_YOUTUBE_DESCRIPTION
+        if _to_int(data.get("image_width"), 0) == 1080 and _to_int(data.get("image_height"), 0) == 1920:
+            data["image_width"] = 1920
+            data["image_height"] = 1080
+        if _to_int(data.get("video_width"), 0) == 1080 and _to_int(data.get("video_height"), 0) == 1920:
+            data["video_width"] = 1920
+            data["video_height"] = 1080
     data["settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
 
