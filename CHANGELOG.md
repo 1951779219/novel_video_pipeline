@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.12
+
+- Cleaned generated subtitle text so only commas and periods remain; other punctuation is converted to spacing before ASS/SRT output.
+- Removed the full-width dark cover title band and updated cover prompts to request an uncluttered title area instead of a dark lower area.
+
 ## v1.0.11
 
 - Changed default image and video dimensions to 16:9 landscape (`1920x1080`) and migrates the old `1080x1920` defaults.

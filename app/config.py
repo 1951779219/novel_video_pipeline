@@ -15,7 +15,7 @@ JOBS_DIR.mkdir(exist_ok=True)
 PROFILES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 3
+SETTINGS_SCHEMA_VERSION = 4
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "💥【爆款短文】《{clean_title}》{intro} #小说 #推文"
 DEFAULT_YOUTUBE_DESCRIPTION = (
     "原创内容，只只推文，每天更新高分又好看的#AI漫画#小说推文\n"
@@ -126,7 +126,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         'Exact story title context: "{title}".\n'
         'Story excerpt: {excerpt}\n'
         'Do not render any words, logos, captions, watermarks, UI, or title text inside the artwork. '
-        'Leave a clean darker lower area for an editor-added title overlay. {style}'
+        'Leave a natural uncluttered lower area for an editor-added title overlay. {style}'
     ),
 
     # 图音配比
@@ -289,6 +289,8 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
         if _to_int(data.get("video_width"), 0) == 1080 and _to_int(data.get("video_height"), 0) == 1920:
             data["video_width"] = 1920
             data["video_height"] = 1080
+        if "Leave a clean darker lower area" in str(data.get("cover_prompt_template") or ""):
+            data["cover_prompt_template"] = DEFAULT_SETTINGS["cover_prompt_template"]
     data["settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
 

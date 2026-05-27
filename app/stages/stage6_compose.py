@@ -719,7 +719,12 @@ def _split_text_to_fit(text: str, chars_per_line: int, max_lines: int) -> list[s
 
 
 def _normalize_subtitle_text(text: str) -> str:
-    return re.sub(r"\s+", " ", html.unescape(text or "")).strip()
+    value = html.unescape(text or "")
+    value = re.sub(r"[，,]+", "，", value)
+    value = re.sub(r"[。\.]+", "。", value)
+    value = re.sub(r"[！？!?；;：:、]+", " ", value)
+    value = re.sub(r"[^\w\s\u4e00-\u9fff，。]", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def _wrap_lines(text: str, chars_per_line: int) -> list[str]:

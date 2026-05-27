@@ -1485,7 +1485,7 @@ def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _
         fallback = (
             f'Create a cinematic YouTube cover illustration for a novel video. '
             f'Exact story title context: "{title}". Story excerpt: {excerpt}. '
-            f'Do not render text in the artwork. Leave clean dark lower space for title overlay. {style}'
+            f'Do not render text in the artwork. Leave natural uncluttered lower space for title overlay. {style}'
         )
 
     if config.llm_api_key or config.llm_provider == "ollama":
@@ -1494,7 +1494,7 @@ def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _
                 "You write one concise English image-generation prompt for a long-form novel recap cover. "
                 "Use the title as fixed story context. Do not ask the image model to render any title, words, "
                 "logos, captions, UI, or watermarks. Keep the scene policy-safe: no gore, blood, corpse, "
-                "nudity, sexual content, weapon close-ups, or explicit violence. Ask for clean darker visual space at the bottom where "
+                "nudity, sexual content, weapon close-ups, or explicit violence. Ask for clean uncluttered visual space at the bottom where "
                 "the video editor will overlay the exact title."
             )
             llm = LLMBackend(
@@ -1517,7 +1517,7 @@ def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _
                 prompt = f'Title context: "{title}". {prompt}'
             return _policy_safe_image_prompt(
                 f'{prompt}. Do not render any words or title text in the image; '
-                f'leave a clean darker lower band for the overlaid title "{title}".',
+                f'leave a natural uncluttered lower area for the overlaid title "{title}".',
                 fallback_text=excerpt,
             )
         except Exception as exc:
@@ -1636,17 +1636,7 @@ def _render_cover_title(raw_path: Path, out_path: Path, title: str) -> Path:
     img = Image.open(raw_path).convert("RGB")
     img = ImageOps.fit(img, (width, height), method=Image.LANCZOS, centering=(0.5, 0.45)).convert("RGBA")
 
-    bg = _hex_rgb(str(config.get("cover_title_bg", "#050505")), (5, 5, 5))
     fg = _hex_rgb(str(config.get("cover_title_color", "#FFFFFF")), (255, 255, 255))
-    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
-    band_top = height - band_h
-    for yy in range(band_top, height):
-        t = (yy - band_top) / max(1, band_h - 1)
-        alpha = int(86 + 158 * (t ** 1.65))
-        overlay_draw.line((0, yy, width, yy), fill=(*bg, alpha))
-    overlay_draw.line((0, band_top, width, band_top), fill=(*fg, 64), width=max(2, height // 360))
-    img = Image.alpha_composite(img, overlay)
 
     draw = ImageDraw.Draw(img)
     title = (title or "Untitled").strip()
