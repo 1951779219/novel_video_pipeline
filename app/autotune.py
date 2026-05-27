@@ -181,6 +181,7 @@ def recommend_settings(snapshot: dict[str, Any]) -> dict[str, Any]:
         "video_encoder": encoder,
         "video_encoder_preset": preset,
         "video_encoder_quality": quality,
+        "max_concurrent_jobs": 1,
         "max_concurrent_external_api": external_api_slots,
         "max_concurrent_ffmpeg": ffmpeg_workers,
         "max_concurrent_media_probe": probe_workers,

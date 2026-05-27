@@ -2225,21 +2225,53 @@ def run_full(
         write_status(job_dir, job_id=job_id, stage=stage, progress=max(0.0, min(1.0, float(value))), **extra)
         on_prog(value)
 
+    job_started = time.monotonic()
+    timings: dict[str, float] = {}
+    timings_lock = threading.Lock()
+
+    def timed(label: str, fn, *args, **kwargs):
+        started = time.monotonic()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            elapsed = time.monotonic() - started
+            with timings_lock:
+                timings[label] = timings.get(label, 0.0) + elapsed
+            log(f"  timing {label}: {elapsed:.1f}s")
+
+    def save_performance() -> dict:
+        with timings_lock:
+            ordered = dict(sorted(timings.items(), key=lambda item: item[1], reverse=True))
+        payload = {
+            "job_id": job_id,
+            "wall_seconds": round(time.monotonic() - job_started, 3),
+            "summed_stage_seconds": round(sum(ordered.values()), 3),
+            "stages": {key: round(value, 3) for key, value in ordered.items()},
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        _write_json(job_dir / "performance.json", payload)
+        if ordered:
+            summary = " | ".join(f"{name} {seconds:.1f}s" for name, seconds in list(ordered.items())[:6])
+            log(f"  performance summary: {summary}")
+        return payload
+
     log(f"== Job {job_id} ==")
     progress("starting", 0.0, input=url_or_id, site=config.scraper_site, worker_pid=os.getpid(), started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
     try:
         progress("scrape", 0.03)
-        novel = stage_scrape(
+        novel = timed(
+            "1_scrape",
+            stage_scrape,
             url_or_id,
             site=config.scraper_site,
             max_chars=config.scraper_max_chars,
             on_log=log,
         )
         _write_novel(job_dir / "novel.json", novel)
-        metadata = stage_metadata(novel, job_dir, on_log=log)
+        metadata = timed("2_metadata", stage_metadata, novel, job_dir, on_log=log)
         progress("clean", 0.10, title=novel.title, short_title=metadata.get("short_title", ""))
 
-        segments = stage_clean(novel, on_log=log, job_dir=job_dir)
+        segments = timed("3_clean", stage_clean, novel, on_log=log, job_dir=job_dir)
         _write_json(job_dir / "segments.json", [{"i": s.index, "text": s.text} for s in segments])
         progress("tts", 0.15, title=novel.title)
 
@@ -2247,11 +2279,13 @@ def run_full(
         if overlap_images:
             log("  overlap enabled: prefetch storyboard/images while TTS is running")
             estimated_durs = [_estimated_speech_duration(s.text) for s in segments]
-            prefetch_plans = stage_pacing(segments, estimated_durs, on_log=log)
+            prefetch_plans = timed("4_pacing_prefetch", stage_pacing, segments, estimated_durs, on_log=log)
             _write_json(job_dir / "plans_prefetch.json", [_image_plan_to_dict(p) for p in prefetch_plans])
             prefetch_dir = job_dir / "_prefetch_images"
             executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pipeline-overlap")
             tts_future = executor.submit(
+                timed,
+                "5_tts",
                 stage_tts,
                 segments,
                 job_dir,
@@ -2259,6 +2293,8 @@ def run_full(
                 lambda p: progress("tts", 0.15 + p * 0.30, title=novel.title),
             )
             image_future = executor.submit(
+                timed,
+                "6_images_prefetch",
                 stage_storyboard_and_image,
                 prefetch_plans,
                 prefetch_dir,
@@ -2268,7 +2304,7 @@ def run_full(
             try:
                 audios, durs = tts_future.result()
                 progress("pacing", 0.45, title=novel.title)
-                plans = stage_pacing(segments, durs, on_log=log)
+                plans = timed("4_pacing_final", stage_pacing, segments, durs, on_log=log)
                 _write_json(job_dir / "plans.json", [_image_plan_to_dict(p) for p in plans])
                 if _plan_signature(plans) == _plan_signature(prefetch_plans):
                     progress("images", 0.50, title=novel.title)
@@ -2278,7 +2314,9 @@ def run_full(
                         log("  reuse prefetched storyboard/images")
                     except Exception as exc:
                         log(f"  WARN prefetched images failed: {exc}; regenerating images after TTS")
-                        images = stage_storyboard_and_image(
+                        images = timed(
+                            "6_images_final",
+                            stage_storyboard_and_image,
                             plans,
                             job_dir,
                             on_log=log,
@@ -2290,7 +2328,9 @@ def run_full(
                         image_future.result()
                     except Exception as exc:
                         log(f"  WARN discarded prefetch image task failed: {exc}")
-                    images = stage_storyboard_and_image(
+                    images = timed(
+                        "6_images_final",
+                        stage_storyboard_and_image,
                         plans,
                         job_dir,
                         on_log=log,
@@ -2299,7 +2339,9 @@ def run_full(
             finally:
                 executor.shutdown(wait=True, cancel_futures=True)
         else:
-            audios, durs = stage_tts(
+            audios, durs = timed(
+                "5_tts",
+                stage_tts,
                 segments,
                 job_dir,
                 on_log=log,
@@ -2307,25 +2349,29 @@ def run_full(
             )
             progress("pacing", 0.45, title=novel.title)
 
-            plans = stage_pacing(segments, durs, on_log=log)
+            plans = timed("4_pacing_final", stage_pacing, segments, durs, on_log=log)
             _write_json(job_dir / "plans.json", [_image_plan_to_dict(p) for p in plans])
             progress("images", 0.50, title=novel.title)
 
-            images = stage_storyboard_and_image(
+            images = timed(
+                "6_images_final",
+                stage_storyboard_and_image,
                 plans,
                 job_dir,
                 on_log=log,
                 on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
             )
         progress("cover", 0.89, title=novel.title)
-        cover = stage_cover(novel, segments, job_dir, on_log=log)
+        cover = timed("7_cover", stage_cover, novel, segments, job_dir, on_log=log)
         progress("compose", 0.90, title=novel.title, cover=str(cover or ""))
 
-        video = stage_compose(audios, durs, segments, plans, images, job_dir, on_log=log)
+        video = timed("8_compose", stage_compose, audios, durs, segments, plans, images, job_dir, on_log=log)
         youtube_url = ""
         if bool(config.upload_enabled):
             progress("upload", 0.96, title=novel.title, short_title=metadata.get("short_title", ""), video=str(video), cover=str(cover or ""))
-            youtube_url = stage_upload(video, novel.title, cover, job_dir, metadata=metadata, on_log=log)
+            youtube_url = timed("9_upload", stage_upload, video, novel.title, cover, job_dir, metadata=metadata, on_log=log)
+
+        performance = save_performance()
 
         result = {
             "job_id": job_id,
@@ -2335,6 +2381,7 @@ def run_full(
             "title": novel.title,
             "short_title": metadata.get("short_title", ""),
             "youtube_url": youtube_url,
+            "performance": performance,
         }
         _write_json(job_dir / "result.json", result)
         progress(

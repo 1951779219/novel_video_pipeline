@@ -400,6 +400,7 @@ class PipelineGUI:
         check("首次启动自动检测", "hardware_autotune_enabled")
         row("硬件检测摘要", "hardware_autotune_summary", "", width=48)
         buttons(("检测电脑并自动配置并发", self._manual_hardware_autotune))
+        row("同时任务数", "max_concurrent_jobs", "1")
         row("外部 API 并发", "max_concurrent_external_api", "2")
         row("FFmpeg 并发", "max_concurrent_ffmpeg", "1")
         row("TTS 并行数", "max_parallel_tts", "2")
@@ -430,7 +431,7 @@ class PipelineGUI:
             "pacing_fixed_count", "video_width", "video_height", "video_fps",
             "video_encoder_quality", "ai_text_clean_batch_chars",
             "image_api_timeout_seconds", "tts_segment_timeout_seconds", "tts_heartbeat_seconds",
-            "max_concurrent_external_api", "max_concurrent_ffmpeg",
+            "max_concurrent_jobs", "max_concurrent_external_api", "max_concurrent_ffmpeg",
             "max_parallel_tts", "max_parallel_images", "max_parallel_video_clips",
             "browser_ad_interval", "browser_ad_start", "dependency_pip_timeout_seconds",
             "cover_width", "cover_height", "cover_title_size",

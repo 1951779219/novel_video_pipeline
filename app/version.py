@@ -1,3 +1,3 @@
 """Application version used by the update system."""
 
-VERSION = "1.0.12"
+VERSION = "1.0.13"

@@ -241,12 +241,18 @@ def build_config_tab():
         save_btn = gr.Button("保存配置", variant="primary")
         with gr.Accordion("Stability / ordinary PCs", open=False):
             with gr.Row():
+                max_concurrent_jobs = gr.Number(value=config.max_concurrent_jobs, label="同时任务数", precision=0)
+                max_parallel_tts = gr.Number(value=config.max_parallel_tts, label="单任务 TTS 并行数", precision=0)
+                max_parallel_images = gr.Number(value=config.max_parallel_images, label="单任务图片并行数", precision=0)
+                max_parallel_video_clips = gr.Number(value=config.max_parallel_video_clips, label="单任务视频片段并行数", precision=0)
+            with gr.Row():
                 max_concurrent_external_api = gr.Number(value=config.max_concurrent_external_api, label="Max external API slots", precision=0)
                 max_concurrent_ffmpeg = gr.Number(value=config.max_concurrent_ffmpeg, label="Max FFmpeg slots", precision=0)
                 max_concurrent_media_probe = gr.Number(value=config.max_concurrent_media_probe, label="Max ffprobe slots", precision=0)
             with gr.Row():
                 resource_wait_timeout = gr.Number(value=config.resource_wait_timeout, label="Slot wait timeout seconds (0 = no limit)", precision=0)
                 worker_detached = gr.Checkbox(value=config.worker_detached, label="Detached worker process")
+                pipeline_overlap_tts_images = gr.Checkbox(value=config.pipeline_overlap_tts_images, label="TTS 与图片重叠执行")
 
         save_msg = gr.Markdown()
 
@@ -313,6 +319,11 @@ def build_config_tab():
             worker_detached,
             tts_segment_timeout_seconds,
             tts_heartbeat_seconds,
+            max_concurrent_jobs,
+            max_parallel_tts,
+            max_parallel_images,
+            max_parallel_video_clips,
+            pipeline_overlap_tts_images,
         ]
 
         def _save(*vals):
@@ -383,6 +394,11 @@ def build_config_tab():
                 "worker_detached": bool(vals[59]),
                 "tts_segment_timeout_seconds": int(vals[60] or 180),
                 "tts_heartbeat_seconds": int(vals[61] or 30),
+                "max_concurrent_jobs": int(vals[62] or 1),
+                "max_parallel_tts": int(vals[63] or 1),
+                "max_parallel_images": int(vals[64] or 1),
+                "max_parallel_video_clips": int(vals[65] or 1),
+                "pipeline_overlap_tts_images": bool(vals[66]),
             }
             return _save_settings(data)
 

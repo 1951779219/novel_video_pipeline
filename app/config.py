@@ -15,7 +15,7 @@ JOBS_DIR.mkdir(exist_ok=True)
 PROFILES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 4
+SETTINGS_SCHEMA_VERSION = 5
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "💥【爆款短文】《{clean_title}》{intro} #小说 #推文"
 DEFAULT_YOUTUBE_DESCRIPTION = (
     "原创内容，只只推文，每天更新高分又好看的#AI漫画#小说推文\n"
@@ -170,7 +170,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "video_long_mode": True,
     "video_cleanup_temp": True,
 
-    "max_concurrent_jobs": 2,
+    "max_concurrent_jobs": 1,
     "max_concurrent_external_api": 2,
     "max_concurrent_ffmpeg": 1,
     "max_concurrent_media_probe": 2,
@@ -291,6 +291,8 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             data["video_height"] = 1080
         if "Leave a clean darker lower area" in str(data.get("cover_prompt_template") or ""):
             data["cover_prompt_template"] = DEFAULT_SETTINGS["cover_prompt_template"]
+        if _to_int(data.get("max_concurrent_jobs"), 0) == 2:
+            data["max_concurrent_jobs"] = 1
     data["settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
 

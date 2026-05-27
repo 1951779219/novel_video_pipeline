@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.13
+
+- Changed the default concurrency model to single-job-first so one job gets the TTS, image, and video parallelism budget instead of splitting resources across multiple jobs by default.
+- Exposed simultaneous job count and per-job TTS/image/video parallel controls in both desktop GUI and WebUI.
+- Added per-job performance timing output (`performance.json` plus a log summary) to identify whether TTS, image generation, cover, compose, or upload is the bottleneck.
+
 ## v1.0.12
 
 - Cleaned generated subtitle text so only commas and periods remain; other punctuation is converted to spacing before ASS/SRT output.
