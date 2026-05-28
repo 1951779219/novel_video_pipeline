@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.14
+
+- Runs Edge TTS synthesis in a child process so `tts_segment_timeout_seconds` can hard-stop stuck segments and fall back through the existing retry/silence path.
+- Cleans leading title/author/intro scaffold text and standalone chapter headings before segmentation.
+- Uses an already generated video image as the cover fallback when cover image generation fails, before falling back to a placeholder.
+- Reduces the default image API timeout from 900 seconds to 300 seconds for legacy configs that still use the old default.
+
 ## v1.0.13
 
 - Changed the default concurrency model to single-job-first so one job gets the TTS, image, and video parallelism budget instead of splitting resources across multiple jobs by default.

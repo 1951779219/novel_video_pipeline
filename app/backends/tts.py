@@ -9,6 +9,10 @@
 """
 import asyncio
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import wave
 import contextlib
 from pathlib import Path
@@ -72,11 +76,47 @@ class TTSBackend:
 
     # ── edge-tts（免费） ─────────────────────────────────
     def _synth_edge(self, text: str, out_path: Path):
-        import edge_tts
-        async def _run():
-            comm = edge_tts.Communicate(text, voice=self.voice, rate=self.rate)
-            await asyncio.wait_for(comm.save(str(out_path)), timeout=self.timeout_seconds)
-        asyncio.run(_run())
+        script = (
+            "import asyncio, pathlib, sys\n"
+            "import edge_tts\n"
+            "text = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')\n"
+            "out = sys.argv[2]\n"
+            "voice = sys.argv[3]\n"
+            "rate = sys.argv[4]\n"
+            "async def main():\n"
+            "    await edge_tts.Communicate(text, voice=voice, rate=rate).save(out)\n"
+            "asyncio.run(main())\n"
+        )
+        text_file = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as handle:
+                handle.write(str(text or ""))
+                text_file = handle.name
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.run(
+                [sys.executable, "-B", "-c", script, text_file, str(out_path), self.voice, self.rate],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=self.timeout_seconds,
+                env=env,
+                **kwargs,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"edge TTS timed out after {self.timeout_seconds:.0f}s") from exc
+        finally:
+            if text_file:
+                try:
+                    Path(text_file).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     # ── voicevox（本地） ─────────────────────────────────
     def _synth_voicevox(self, text: str, out_path: Path):

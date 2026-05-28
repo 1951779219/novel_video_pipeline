@@ -558,12 +558,81 @@ def stage_scrape(
 
 def stage_clean(novel: Novel, on_log: LogFn = _noop, job_dir: Path | None = None) -> list[Segment]:
     on_log("[2/6] 清洗 + 切片")
-    text = _clean_non_story_text(novel.full_text, on_log=on_log, job_dir=job_dir)
+    text = _strip_story_scaffold(novel.full_text, novel, on_log=on_log, job_dir=job_dir)
+    text = _clean_non_story_text(text, on_log=on_log, job_dir=job_dir)
     segs = split_segments(text)
     on_log(f"  OK 切成 {len(segs)} 段")
     if not segs:
         raise RuntimeError("正文切片结果为空")
     return segs
+
+
+_CHAPTER_HEADING_RE = re.compile(
+    r"^\s*(?:"
+    r"第[\d零〇一二三四五六七八九十百千万两]+[章节章回话話卷集部篇].{0,40}|"
+    r"chapter\s*\d+.{0,40}|"
+    r"(?:序章|楔子|引子|尾声|番外).{0,30}"
+    r")\s*$",
+    re.I,
+)
+_INTRO_HEADING_RE = re.compile(r"^\s*(?:简介|内容简介|小说简介|作品简介|书籍简介|文案|作者|作者名|书名|小说名)\s*[:：]", re.I)
+
+
+def _strip_story_scaffold(text: str, novel: Novel, on_log: LogFn = _noop, job_dir: Path | None = None) -> str:
+    source = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not source.strip():
+        return source
+    title_values = {
+        re.sub(r"\s+", "", str(value or ""))
+        for value in (novel.title, _clean_display_title(novel.title))
+        if str(value or "").strip()
+    }
+    author_value = re.sub(r"\s+", "", str(novel.author or ""))
+    description_value = re.sub(r"\s+", "", str(novel.description or ""))
+    cleaned: list[str] = []
+    removed_leading = 0
+    removed_chapters = 0
+    leading_window_open = True
+    for raw_line in source.split("\n"):
+        stripped = raw_line.strip()
+        compact = re.sub(r"\s+", "", stripped)
+        if leading_window_open and len(cleaned) < 24:
+            remove_leading = False
+            if not stripped:
+                remove_leading = removed_leading > 0
+            elif compact in title_values:
+                remove_leading = True
+            elif author_value and (compact == author_value or compact in {f"作者:{author_value}", f"作者：{author_value}"}):
+                remove_leading = True
+            elif description_value and compact and compact in description_value and len(compact) <= 120:
+                remove_leading = True
+            elif _INTRO_HEADING_RE.search(stripped):
+                remove_leading = True
+            if remove_leading:
+                removed_leading += 1
+                continue
+            if stripped:
+                leading_window_open = False
+        if stripped and _CHAPTER_HEADING_RE.match(stripped):
+            removed_chapters += 1
+            continue
+        cleaned.append(raw_line)
+    result = "\n".join(cleaned).strip()
+    if not result:
+        return source
+    if removed_leading or removed_chapters:
+        if job_dir is not None:
+            _write_json(
+                job_dir / "story_scaffold_clean_report.json",
+                {
+                    "removed_leading_lines": removed_leading,
+                    "removed_chapter_headings": removed_chapters,
+                    "chars_before": len(source),
+                    "chars_after": len(result),
+                },
+            )
+        on_log(f"  story scaffold clean: removed {removed_leading} leading lines and {removed_chapters} chapter headings")
+    return result
 
 
 _NON_STORY_PATTERNS = [
@@ -1787,8 +1856,10 @@ def stage_cover(
         raw_tmp.replace(raw_path)
     except Exception as exc:
         raw_tmp.unlink(missing_ok=True)
-        on_log(f"  WARN cover image generation failed: {exc}; use placeholder")
-        _create_cover_placeholder(prompt, title, raw_path, width, height)
+        on_log(f"  WARN cover image generation failed: {exc}; use generated video image fallback")
+        if not _create_cover_from_video_image(job_dir, raw_path, width, height):
+            on_log("  WARN no generated image available for cover fallback; use placeholder")
+            _create_cover_placeholder(prompt, title, raw_path, width, height)
 
     _render_cover_title(raw_path, out_path, title)
     _write_json(
@@ -1808,6 +1879,20 @@ def stage_cover(
     )
     on_log(f"  OK cover: {out_path}")
     return out_path
+
+
+def _create_cover_from_video_image(job_dir: Path, out_path: Path, width: int, height: int) -> bool:
+    image_dir = job_dir / "images"
+    candidates = sorted(image_dir.glob("img_*.png")) + sorted(image_dir.glob("*.jpg")) + sorted(image_dir.glob("*.jpeg"))
+    for src in candidates:
+        try:
+            with Image.open(src) as img:
+                fitted = ImageOps.fit(img.convert("RGB"), (max(1, int(width)), max(1, int(height))), method=Image.LANCZOS)
+                fitted.save(out_path, "PNG")
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _load_compose_manifest(path: Path) -> dict:
@@ -2409,8 +2494,20 @@ def _prompt_for_plan(llm: LLMBackend, plan: ImagePlan, on_log: LogFn, index: int
             with external_api_slot(action=f"storyboard {index}"):
                 return _policy_safe_image_prompt(llm.storyboard(plan.text), fallback_text=plan.text)
         except Exception as exc:
-            on_log(f"  WARN 分镜{index} LLM 失败: {exc}，用原文兜底")
-    return _policy_safe_image_prompt(plan.text[:160] + ", " + config.llm_image_style_suffix, fallback_text=plan.text)
+            on_log(f"  WARN storyboard {index} LLM failed: {exc}; using safe template fallback")
+    return _fallback_storyboard_prompt(plan.text)
+
+
+def _fallback_storyboard_prompt(text: str) -> str:
+    excerpt = re.sub(r"\s+", " ", str(text or "")).strip()
+    excerpt = re.sub(r"[\"'`<>#]", " ", excerpt)[:120]
+    prompt = (
+        "Cinematic anime illustration for a novel recap scene. "
+        "Show adult-looking characters in symbolic emotional drama, expressive faces, "
+        "clean composition, soft lighting, no readable text. "
+        f"Story mood reference: {excerpt}. {config.llm_image_style_suffix}"
+    )
+    return _policy_safe_image_prompt(prompt, fallback_text="")
 
 
 def _plan_signature(plans: list[ImagePlan]) -> list[list[int]]:
