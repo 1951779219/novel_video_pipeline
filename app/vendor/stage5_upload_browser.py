@@ -17,6 +17,23 @@ from pathlib import Path
 from typing import Callable, Optional
 
 _DEBUG_PORT = 9222
+
+
+def _is_browser_disconnect_error(exc_or_text) -> bool:
+    text = str(exc_or_text or "").lower()
+    needles = (
+        "target page, context or browser has been closed",
+        "connection closed",
+        "websocket",
+        "targetclosederror",
+        "browser has been closed",
+        "browser has been disconnected",
+        "connection reset",
+        "protocol error",
+    )
+    return any(needle in text for needle in needles)
+
+
 _STALL = "STALL"   # 标志：上传卡住，需要外层重启浏览器
 
 
@@ -340,6 +357,9 @@ def _run_upload_session(job, config, video_path, title, cover_path,
                             page.goto("https://studio.youtube.com", timeout=60_000)
                         page.wait_for_load_state("domcontentloaded", timeout=30_000)
                     except Exception as nav_e:
+                        if _is_browser_disconnect_error(nav_e):
+                            on_log(f"  ⚠️ Chrome 连接已断开，准备重启后重试: {str(nav_e)[:80]}")
+                            return "CHROME_CRASH"
                         on_log(f"  导航失败: {nav_e}，继续尝试...")
 
                 ban_check = getattr(job, "mode", "full") == "ban_check"
@@ -352,9 +372,7 @@ def _run_upload_session(job, config, video_path, title, cover_path,
                     )
                 except Exception as e:
                     err = str(e)
-                    if "Target page, context or browser has been closed" in err or \
-                       "Connection closed" in err or "WebSocket" in err or \
-                       "TargetClosedError" in err:
+                    if _is_browser_disconnect_error(err):
                         on_log(f"  ⚠️ Chrome 连接断开: {err[:80]}")
                         return "CHROME_CRASH"
                     on_log(f"  上传异常: {e}")

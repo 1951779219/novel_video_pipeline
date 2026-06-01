@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.15
+
+- Treat Playwright/CDP disconnects during YouTube upload retry navigation as a Chrome crash so the outer upload loop restarts Chrome instead of reusing a dead page.
+
 ## v1.0.14
 
 - Runs Edge TTS synthesis in a child process so `tts_segment_timeout_seconds` can hard-stop stuck segments and fall back through the existing retry/silence path.
