@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.16
+
+- Bound TTS external API slot waits by `tts_segment_timeout_seconds` so stuck slot contention no longer leaves narration segments waiting indefinitely.
+- Mark TTS manifest entries as `waiting_slot` until they actually acquire an external API slot, so long waits are easier to distinguish from an active speech request.
+- Bound image external API slot waits by `image_api_timeout_seconds` so image generation can fall back to the existing placeholder path instead of hanging forever behind a stuck slot.
+
 ## v1.0.15
 
 - Treat Playwright/CDP disconnects during YouTube upload retry navigation as a Chrome crash so the outer upload loop restarts Chrome instead of reusing a dead page.

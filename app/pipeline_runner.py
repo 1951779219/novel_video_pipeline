@@ -51,6 +51,14 @@ def _parallel_limit(config_key: str, default: int, total: int, hard_cap: int = 1
     return max(1, min(int(total or 1), hard_cap, raw))
 
 
+def _bounded_timeout(value, default: float, minimum: float = 30.0, maximum: float = 1800.0) -> float:
+    try:
+        seconds = float(value if value not in (None, "") else default)
+    except Exception:
+        seconds = float(default)
+    return max(minimum, min(maximum, seconds))
+
+
 def _noop(*_args, **_kwargs):
     pass
 
@@ -901,9 +909,10 @@ def _stage_tts_manifest_impl(
     on_prog: ProgFn,
 ) -> tuple[list[Path], list[float]]:
     workers = _parallel_limit("max_parallel_tts", 2, len(segments), hard_cap=12)
+    segment_timeout_seconds = _bounded_timeout(config.get("tts_segment_timeout_seconds", 180), 180.0)
     on_log(
         f"[3/6] TTS provider={config.tts_provider} voice={config.tts_voice} "
-        f"volume={config.get('tts_volume', 1.0)} parallel={workers}"
+        f"volume={config.get('tts_volume', 1.0)} parallel={workers} timeout={segment_timeout_seconds:.0f}s"
     )
 
     def make_tts() -> TTSBackend:
@@ -917,7 +926,7 @@ def _stage_tts_manifest_impl(
                 **(config.tts_extra or {}),
                 "emotion": config.tts_emotion,
                 "model": config.get("tts_model", "tts-1"),
-                "timeout_seconds": config.get("tts_segment_timeout_seconds", 180),
+                "timeout_seconds": segment_timeout_seconds,
             },
             volume=config.get("tts_volume", 1.0),
         )
@@ -1006,15 +1015,28 @@ def _stage_tts_manifest_impl(
                         {
                             **expected,
                             "index": i,
-                            "status": "running",
+                            "status": "waiting_slot",
                             "path": str(out),
                             "attempt": attempt,
                             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                         },
                     )
-                    mark_running(i, attempt)
                     try:
-                        with external_api_slot(action=f"tts {i + 1}/{len(segments)}"):
+                        with external_api_slot(
+                            action=f"tts {i + 1}/{len(segments)}",
+                            timeout_seconds=segment_timeout_seconds,
+                        ):
+                            set_manifest(
+                                {
+                                    **expected,
+                                    "index": i,
+                                    "status": "running",
+                                    "path": str(out),
+                                    "attempt": attempt,
+                                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                },
+                            )
+                            mark_running(i, attempt)
                             d = tts.synth(seg.text, tmp)
                         if d <= 0.05:
                             raise RuntimeError("audio duration is zero")
@@ -1208,7 +1230,11 @@ def stage_storyboard_and_image(
     on_prog: ProgFn = _noop,
 ) -> list[Path]:
     workers = _parallel_limit("max_parallel_images", 2, len(plans), hard_cap=8)
-    on_log(f"[5/6] 分镜+出图: llm={config.llm_provider} image={config.image_provider} parallel={workers}")
+    image_timeout_seconds = _bounded_timeout(config.get("image_api_timeout_seconds", 300), 300.0)
+    on_log(
+        f"[5/6] 分镜+出图: llm={config.llm_provider} image={config.image_provider} "
+        f"parallel={workers} timeout={image_timeout_seconds:.0f}s"
+    )
 
     def make_llm() -> LLMBackend:
         return LLMBackend(
@@ -1269,7 +1295,10 @@ def stage_storyboard_and_image(
                             height=config.image_height,
                         )
                     else:
-                        with external_api_slot(action=f"image {i + 1}/{len(plans)}"):
+                        with external_api_slot(
+                            action=f"image {i + 1}/{len(plans)}",
+                            timeout_seconds=image_timeout_seconds,
+                        ):
                             make_image_backend().generate(
                                 attempt_prompt,
                                 config.llm_negative_prompt,
