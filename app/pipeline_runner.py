@@ -1255,7 +1255,7 @@ def stage_storyboard_and_image(
             steps=config.image_steps,
             cfg=config.image_cfg,
             workflow_path=config.image_workflow,
-            timeout_seconds=config.get("image_api_timeout_seconds", 900),
+            timeout_seconds=config.get("image_api_timeout_seconds", 300),
         )
 
     img_dir = job_dir / "images"
@@ -1872,7 +1872,7 @@ def stage_cover(
         steps=config.image_steps,
         cfg=config.image_cfg,
         workflow_path=config.image_workflow,
-        timeout_seconds=config.get("image_api_timeout_seconds", 900),
+        timeout_seconds=config.get("image_api_timeout_seconds", 300),
     )
     raw_tmp = raw_path.with_suffix(".tmp.png")
     raw_tmp.unlink(missing_ok=True)

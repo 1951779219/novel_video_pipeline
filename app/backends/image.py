@@ -69,7 +69,7 @@ def _fit_generated_image(img: Image.Image, width: int, height: int) -> Image.Ima
 class ImageBackend:
     def __init__(self, provider: str, base_url: str = "", api_key: str = "",
                  model: str = "", steps: int = 25, cfg: float = 7.0,
-                 workflow_path: str = "", timeout_seconds: int | float = 900):
+                 workflow_path: str = "", timeout_seconds: int | float = 300):
         self.provider = provider
         self.base_url = base_url.rstrip("/") if base_url else ""
         self.api_key = api_key
@@ -77,7 +77,7 @@ class ImageBackend:
         self.steps = steps
         self.cfg = cfg
         self.workflow_path = workflow_path
-        self.timeout_seconds = max(60.0, float(timeout_seconds or 900))
+        self.timeout_seconds = max(60.0, float(timeout_seconds or 300))
 
     def generate(self, prompt: str, negative: str, out_path: Path,
                  width: int = 1080, height: int = 1920) -> Path:

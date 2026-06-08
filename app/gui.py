@@ -333,7 +333,7 @@ class PipelineGUI:
         row("图片 Base URL/中转", "image_base_url", "")
         row("图片 API Key", "image_api_key", "")
         model_combo("图片模型名", "image_model", "", ["gpt-image-1", "dall-e-3"])
-        row("图片 API 超时秒", "image_api_timeout_seconds", "900")
+        row("图片 API 超时秒", "image_api_timeout_seconds", "300")
         row("风格后缀", "llm_image_style_suffix", "")
         row("分镜 LLM Provider", "llm_provider", "openai")
         model_combo("分镜模型", "llm_model", "gpt-4o-mini", ["gpt-4o-mini", "gpt-4o", "deepseek-chat"])
