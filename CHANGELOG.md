@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.17
+
+- Align image API timeout defaults to 300 seconds across GUI, runner, and backend fallback paths so legacy or unset configs do not keep image requests waiting for the older 900-second default.
+
 ## v1.0.16
 
 - Bound TTS external API slot waits by `tts_segment_timeout_seconds` so stuck slot contention no longer leaves narration segments waiting indefinitely.
