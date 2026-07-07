@@ -11,6 +11,7 @@
 import base64
 import io
 import json
+import mimetypes
 import re
 import time
 import uuid
@@ -70,7 +71,7 @@ class ImageBackend:
     def __init__(self, provider: str, base_url: str = "", api_key: str = "",
                  model: str = "", steps: int = 25, cfg: float = 7.0,
                  workflow_path: str = "", timeout_seconds: int | float = 300):
-        self.provider = provider
+        self.provider = str(provider or "placeholder").lower()
         self.base_url = base_url.rstrip("/") if base_url else ""
         self.api_key = api_key
         self.model = model
@@ -87,6 +88,32 @@ class ImageBackend:
             raise ValueError(f"未知 image provider: {self.provider}")
         method(prompt, negative, out_path, width, height)
         return out_path
+
+    def generate_with_references(
+        self,
+        prompt: str,
+        negative: str,
+        reference_paths: list[Path],
+        out_path: Path,
+        width: int = 1080,
+        height: int = 1920,
+    ) -> Path:
+        """Generate an image with optional reference images.
+
+        OpenAI-compatible providers use /images/edits. Providers without a
+        generic reference-image API fall back to text-to-image so one pipeline
+        can route all image jobs through the same abstraction safely.
+        """
+        refs = [Path(p) for p in reference_paths if p and Path(p).exists()]
+        if refs and self.provider in {"openai", "custom"}:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            self._gen_openai_edit(prompt, negative, refs, out_path, width, height)
+            return out_path
+        if refs and self.provider == "sdwebui":
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            self._gen_sdwebui_img2img(prompt, negative, refs[0], out_path, width, height)
+            return out_path
+        return self.generate(prompt, negative, out_path, width=width, height=height)
 
     # ── placeholder ─────────────────────────────────────
     def _gen_placeholder(self, prompt, negative, out_path, w, h):
@@ -125,6 +152,28 @@ class ImageBackend:
         b64 = data["images"][0]
         img_bytes = base64.b64decode(b64.split(",", 1)[-1])
         out_path.write_bytes(img_bytes)
+
+    def _gen_sdwebui_img2img(self, prompt, negative, reference_path, out_path, w, h):
+        url = f"{self.base_url or 'http://127.0.0.1:7860'}/sdapi/v1/img2img"
+        with Image.open(reference_path) as img:
+            buf = io.BytesIO()
+            _fit_generated_image(img, w, h).save(buf, "PNG")
+        payload = {
+            "prompt": prompt,
+            "negative_prompt": negative,
+            "init_images": [base64.b64encode(buf.getvalue()).decode("ascii")],
+            "width": w,
+            "height": h,
+            "steps": self.steps,
+            "cfg_scale": self.cfg,
+            "denoising_strength": 0.55,
+            "sampler_name": "DPM++ 2M Karras",
+        }
+        r = httpx.post(url, json=payload, timeout=self.timeout_seconds)
+        r.raise_for_status()
+        data = r.json()
+        b64 = data["images"][0]
+        out_path.write_bytes(base64.b64decode(b64.split(",", 1)[-1]))
 
     # ── ComfyUI ─────────────────────────────────────────
     def _gen_comfyui(self, prompt, negative, out_path, w, h):
@@ -207,6 +256,39 @@ class ImageBackend:
         img = _fit_generated_image(self._post_openai_image(url, headers, payload), w, h)
         img.save(out_path, "PNG")
 
+    def _gen_openai_edit(self, prompt, negative, reference_paths, out_path, w, h):
+        base = self.base_url or "https://api.openai.com/v1"
+        url = f"{base}/images/edits"
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        model = self.model or "gpt-image-1"
+        edit_prompt = str(prompt or "")
+        if negative:
+            edit_prompt = f"{edit_prompt}\nAvoid: {negative}"
+        data = {
+            "model": model,
+            "prompt": edit_prompt,
+            "size": _openai_image_size(model, w, h),
+            "n": "1",
+        }
+        files = []
+        handles = []
+        try:
+            for path in reference_paths:
+                handle = Path(path).open("rb")
+                handles.append(handle)
+                mime = mimetypes.guess_type(str(path))[0] or "image/png"
+                files.append(("image", (Path(path).name, handle, mime)))
+            img = _fit_generated_image(self._post_openai_image_multipart(url, headers, data, files), w, h)
+            img.save(out_path, "PNG")
+        finally:
+            for handle in handles:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
     def _post_openai_image(self, url: str, headers: dict, payload: dict) -> Image.Image:
         try:
             r = httpx.post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
@@ -226,6 +308,19 @@ class ImageBackend:
                     f"OpenAI image request failed after retry. first={first_error}; retry={retry_error}.{hint}"
                 ) from retry_exc
         data = r.json()
+        return self._openai_response_image(data)
+
+    def _post_openai_image_multipart(self, url: str, headers: dict, data: dict, files: list) -> Image.Image:
+        try:
+            r = httpx.post(url, data=data, files=files, headers=headers, timeout=self.timeout_seconds)
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            first_error = _http_error_detail(exc)
+            hint = _image_model_hint(str(data.get("model") or ""))
+            raise RuntimeError(f"OpenAI image edit request failed. first={first_error}.{hint}") from exc
+        return self._openai_response_image(r.json())
+
+    def _openai_response_image(self, data: dict) -> Image.Image:
         row = (data.get("data") or [{}])[0]
         b64_value = row.get("b64_json") or row.get("image") or row.get("content")
         if b64_value:

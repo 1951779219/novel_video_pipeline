@@ -36,6 +36,14 @@ from app.stages.stage_pacing import ImagePlan, plan_images
 from app.backends.image import ImageBackend
 from app.backends.llm import LLMBackend
 from app.backends.tts import TTSBackend, _audio_duration
+from app.character_analysis import (
+    DEFAULT_CHARACTER_ANALYSIS_PROMPT,
+    analyze_characters,
+    can_call_analysis_llm,
+    character_context_for_text,
+    character_reference_prompt,
+    visual_theme_context,
+)
 from app.utils.ffmpeg import ffmpeg_path
 
 
@@ -218,6 +226,12 @@ def _safe_job_path(job_id: str) -> Path:
     if path == root or root not in path.parents:
         raise ValueError(f"unsafe job path: {path}")
     return path
+
+
+def _safe_artifact_name(value: str, fallback: str = "artifact") -> str:
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value or "").strip())
+    text = re.sub(r"\s+", "_", text).strip(" ._")
+    return (text[:80].rstrip(" ._") or fallback)
 
 
 def _terminate_process_tree(pid: int, *, timeout_seconds: float = 8.0) -> bool:
@@ -1174,6 +1188,223 @@ def stage_pacing(
     return plans
 
 
+def stage_character_analysis(
+    novel: Novel,
+    segments: list[Segment],
+    job_dir: Path,
+    on_log: LogFn = _noop,
+) -> dict | None:
+    if not bool(config.get("character_analysis_enabled", False)):
+        return None
+    out = job_dir / "character_profiles.json"
+    if out.exists():
+        try:
+            cached = json.loads(out.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and cached.get("enabled"):
+                on_log(f"  character analysis reuse cached profiles: {out.name}")
+                return cached
+        except Exception:
+            pass
+
+    if not can_call_analysis_llm(config.llm_provider, config.llm_api_key):
+        payload = {"enabled": False, "reason": "LLM API key is empty and provider is not ollama/custom"}
+        _write_json(out, payload)
+        on_log("  WARN character analysis skipped: no usable LLM credentials")
+        return payload
+
+    on_log("[4/6] character analysis: extracting protagonists, supporting roles, and visual locks")
+    llm = LLMBackend(
+        provider=config.llm_provider,
+        base_url=config.llm_base_url,
+        api_key=config.llm_api_key,
+        model=config.llm_model,
+        system_prompt=config.llm_storyboard_prompt,
+        style_suffix="",
+    )
+    try:
+        payload = analyze_characters(
+            novel,
+            segments,
+            llm,
+            max_chars=int(config.get("character_analysis_max_chars", 12000) or 12000),
+            max_tokens=int(config.get("character_analysis_max_tokens", 1800) or 1800),
+            system_prompt=str(config.get("character_analysis_prompt", "") or DEFAULT_CHARACTER_ANALYSIS_PROMPT),
+        )
+    except Exception as exc:
+        payload = {"enabled": False, "reason": f"character analysis failed: {exc}"}
+        _write_json(out, payload)
+        on_log(f"  WARN character analysis failed: {exc}")
+        return payload
+
+    _write_json(out, payload)
+    characters = payload.get("characters") if isinstance(payload, dict) else []
+    on_log(f"  OK character profiles: {len(characters) if isinstance(characters, list) else 0} characters -> {out.name}")
+    return payload
+
+
+def _image_route_settings(role: str) -> dict:
+    role = str(role or "scene")
+    if role == "scene":
+        return {
+            "provider": str(config.image_provider or "placeholder"),
+            "base_url": str(config.image_base_url or ""),
+            "api_key": str(config.image_api_key or ""),
+            "model": str(config.image_model or ""),
+            "workflow_path": str(config.image_workflow or ""),
+        }
+
+    if role == "cover":
+        provider = str(config.get("cover_provider", "same_as_image") or "").strip()
+        if provider in {"", "same_as_image", "同配图", "同图片"}:
+            return _image_route_settings("scene")
+        return {
+            "provider": provider,
+            "base_url": str(config.get("cover_base_url", "") or config.image_base_url or ""),
+            "api_key": str(config.get("cover_api_key", "") or config.image_api_key or ""),
+            "model": str(config.get("cover_model", "") or config.image_model or ""),
+            "workflow_path": str(config.image_workflow or ""),
+        }
+
+    if role == "character_reference":
+        provider = str(config.get("character_reference_provider", "same_as_image") or "").strip()
+        if provider in {"", "same_as_image", "同配图", "同图片"}:
+            return _image_route_settings("scene")
+        return {
+            "provider": provider,
+            "base_url": str(config.get("character_reference_base_url", "") or config.image_base_url or ""),
+            "api_key": str(config.get("character_reference_api_key", "") or config.image_api_key or ""),
+            "model": str(config.get("character_reference_model", "") or config.image_model or ""),
+            "workflow_path": str(config.get("character_reference_workflow", "") or config.image_workflow or ""),
+        }
+
+    if role == "scene_reference":
+        provider = str(config.get("scene_reference_provider", "same_as_image") or "").strip()
+        if provider in {"", "same_as_image", "同配图", "同图片"}:
+            return _image_route_settings("scene")
+        return {
+            "provider": provider,
+            "base_url": str(config.get("scene_reference_base_url", "") or config.image_base_url or ""),
+            "api_key": str(config.get("scene_reference_api_key", "") or config.image_api_key or ""),
+            "model": str(config.get("scene_reference_model", "") or config.image_model or ""),
+            "workflow_path": str(config.get("scene_reference_workflow", "") or config.image_workflow or ""),
+        }
+
+    return _image_route_settings("scene")
+
+
+def _make_image_backend(route: dict, *, provider: str | None = None) -> ImageBackend:
+    return ImageBackend(
+        provider=provider or route["provider"],
+        base_url=route.get("base_url", ""),
+        api_key=route.get("api_key", ""),
+        model=route.get("model", ""),
+        steps=config.image_steps,
+        cfg=config.image_cfg,
+        workflow_path=route.get("workflow_path", ""),
+        timeout_seconds=config.get("image_api_timeout_seconds", 300),
+    )
+
+
+def _reference_images_for_text(analysis: dict | None, text: str, *, max_count: int = 2) -> list[Path]:
+    if not analysis or not analysis.get("enabled"):
+        return []
+    characters = analysis.get("characters")
+    if not isinstance(characters, list):
+        return []
+    haystack = str(text or "")
+    protagonist_names = set(str(x).strip() for x in (analysis.get("protagonists") or []) if str(x).strip())
+    matched: list[dict] = []
+    for item in characters:
+        if not isinstance(item, dict):
+            continue
+        names = [str(item.get("name") or "").strip()]
+        aliases = item.get("aliases")
+        if isinstance(aliases, list):
+            names.extend(str(x).strip() for x in aliases)
+        if any(name and name in haystack for name in names):
+            matched.append(item)
+    if bool(config.get("character_analysis_always_include_protagonists", True)):
+        for item in characters:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name") or "").strip() in protagonist_names and item not in matched:
+                matched.append(item)
+            if len(matched) >= max_count:
+                break
+
+    paths: list[Path] = []
+    for item in matched[: max(1, int(max_count or 1))]:
+        ref = str(item.get("reference_image") or "").strip()
+        if ref:
+            path = Path(ref)
+            if path.exists():
+                paths.append(path)
+    return paths
+
+
+def stage_character_references(
+    character_analysis: dict | None,
+    job_dir: Path,
+    on_log: LogFn = _noop,
+) -> dict | None:
+    if not character_analysis or not character_analysis.get("enabled"):
+        return character_analysis
+    if not bool(config.get("character_reference_enabled", False)):
+        return character_analysis
+
+    characters = character_analysis.get("characters")
+    if not isinstance(characters, list) or not characters:
+        return character_analysis
+
+    route = _image_route_settings("character_reference")
+    provider = route["provider"]
+    width = int(config.get("character_reference_width", 768) or 768)
+    height = int(config.get("character_reference_height", 1024) or 1024)
+    max_count = max(1, int(config.get("character_reference_max_count", 6) or 6))
+    timeout_seconds = _bounded_timeout(config.get("image_api_timeout_seconds", 300), 300.0)
+    char_dir = job_dir / "characters"
+    char_dir.mkdir(parents=True, exist_ok=True)
+
+    backend = _make_image_backend(route)
+    manifest: list[dict] = []
+    selected = [
+        c for c in characters
+        if isinstance(c, dict) and str(c.get("importance") or "") in {"protagonist", "supporting"}
+    ][:max_count]
+    if not selected:
+        selected = [c for c in characters if isinstance(c, dict)][:max_count]
+
+    on_log(f"[4/6] character references: provider={provider} count={len(selected)} size={width}x{height}")
+    for i, character in enumerate(selected):
+        name = str(character.get("name") or f"character_{i + 1}").strip()
+        trigger = str(character.get("trigger") or f"char_{i + 1:02d}").strip()
+        out = char_dir / f"{_safe_artifact_name(trigger or name, f'char_{i + 1:02d}')}.png"
+        prompt = character_reference_prompt(character, character_analysis)
+        suffix = str(config.get("character_reference_prompt_suffix", "") or "").strip()
+        if suffix:
+            prompt = f"{prompt}. {suffix}"
+        prompt = _policy_safe_image_prompt(prompt, fallback_text=name)
+        character["reference_image"] = str(out)
+        character["reference_prompt"] = prompt
+        manifest.append({"name": name, "trigger": trigger, "path": str(out), "prompt": prompt})
+        if out.exists() and out.stat().st_size > 100:
+            on_log(f"  character reference reuse {name}: {out.name}")
+            continue
+        try:
+            if provider == "placeholder":
+                backend.generate(prompt, config.llm_negative_prompt, out, width=width, height=height)
+            else:
+                with external_api_slot(action=f"character reference {name}", timeout_seconds=timeout_seconds):
+                    backend.generate(prompt, config.llm_negative_prompt, out, width=width, height=height)
+            on_log(f"  character reference {i + 1}/{len(selected)} OK: {name} -> {out.name}")
+        except Exception as exc:
+            on_log(f"  WARN character reference failed for {name}: {exc}")
+
+    _write_json(job_dir / "character_reference_manifest.json", manifest)
+    _write_json(job_dir / "character_profiles.json", character_analysis)
+    return character_analysis
+
+
 _POLICY_REPLACEMENTS = [
     (r"\b(severed limbs?|dismember(?:ed|ment)?|guts?|corpse|corpses|dead bod(?:y|ies)|rivers? of blood)\b", "dramatic aftermath implied by scattered shadows"),
     (r"\b(bloody|blood-soaked|blood splatter|gore|graphic violence|massacre)\b", "tense dramatic atmosphere"),
@@ -1226,13 +1457,16 @@ def _is_image_policy_error(exc: Exception) -> bool:
 def stage_storyboard_and_image(
     plans: list[ImagePlan],
     job_dir: Path,
+    character_analysis: dict | None = None,
     on_log: LogFn = _noop,
     on_prog: ProgFn = _noop,
 ) -> list[Path]:
     workers = _parallel_limit("max_parallel_images", 2, len(plans), hard_cap=8)
     image_timeout_seconds = _bounded_timeout(config.get("image_api_timeout_seconds", 300), 300.0)
+    scene_route = _image_route_settings("scene")
+    scene_reference_route = _image_route_settings("scene_reference")
     on_log(
-        f"[5/6] 分镜+出图: llm={config.llm_provider} image={config.image_provider} "
+        f"[5/6] 分镜+出图: llm={config.llm_provider} image={scene_route['provider']} "
         f"parallel={workers} timeout={image_timeout_seconds:.0f}s"
     )
 
@@ -1247,16 +1481,10 @@ def stage_storyboard_and_image(
         )
 
     def make_image_backend(provider: str | None = None) -> ImageBackend:
-        return ImageBackend(
-            provider=provider or config.image_provider,
-            base_url=config.image_base_url,
-            api_key=config.image_api_key,
-            model=config.image_model,
-            steps=config.image_steps,
-            cfg=config.image_cfg,
-            workflow_path=config.image_workflow,
-            timeout_seconds=config.get("image_api_timeout_seconds", 300),
-        )
+        return _make_image_backend(scene_route, provider=provider)
+
+    def make_scene_reference_backend() -> ImageBackend:
+        return _make_image_backend(scene_reference_route)
 
     img_dir = job_dir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -1266,15 +1494,39 @@ def stage_storyboard_and_image(
 
     def process_image(i: int, plan: ImagePlan) -> tuple[int, Path, str]:
         out = img_dir / f"img_{i:05d}.png"
-        prompt = _policy_safe_image_prompt(_prompt_for_plan(make_llm(), plan, on_log, i), fallback_text=plan.text)
-        prompts_log[i] = {"index": i, "text": plan.text, "prompt": prompt}
+        base_prompt = _prompt_for_plan(make_llm(), plan, on_log, i)
+        theme_context = visual_theme_context(character_analysis) if bool(config.get("scene_inject_visual_theme", True)) else ""
+        character_context = character_context_for_text(
+            character_analysis,
+            plan.text,
+            max_characters=int(config.get("character_analysis_max_characters_per_prompt", 4) or 4),
+            always_include_protagonists=bool(config.get("character_analysis_always_include_protagonists", True)),
+        ) if bool(config.get("scene_inject_character_triggers", True)) else ""
+        if theme_context and theme_context not in character_context:
+            base_prompt = f"{base_prompt}. {theme_context}"
+        if character_context:
+            base_prompt = f"{base_prompt}. {character_context}"
+        prompt = _policy_safe_image_prompt(base_prompt, fallback_text=plan.text)
+        reference_paths = _reference_images_for_text(
+            character_analysis,
+            plan.text,
+            max_count=int(config.get("scene_reference_max_images", 2) or 2),
+        ) if bool(config.get("scene_reference_enabled", False)) else []
+        prompts_log[i] = {
+            "index": i,
+            "text": plan.text,
+            "prompt": prompt,
+            "theme_context": theme_context,
+            "character_context": character_context,
+            "reference_images": [str(p) for p in reference_paths],
+        }
         if not out.exists() or out.stat().st_size < 100:
             last_exc: Exception | None = None
             for attempt in range(1, 3):
                 try:
                     on_log(
-                        f"  image {i + 1}/{len(plans)} call provider={config.image_provider} "
-                        f"base={config.image_base_url or '-'} model={config.image_model or '-'} "
+                        f"  image {i + 1}/{len(plans)} call provider={scene_route['provider']} "
+                        f"base={scene_route.get('base_url') or '-'} model={scene_route.get('model') or '-'} "
                         f"size={config.image_width}x{config.image_height} attempt={attempt}"
                     )
                     attempt_prompt = prompt
@@ -1286,7 +1538,7 @@ def stage_storyboard_and_image(
                         )
                         prompts_log[i] = {"index": i, "text": plan.text, "prompt": attempt_prompt, "safe_retry": True}
                         on_log(f"  image {i + 1}/{len(plans)} retry with safer prompt")
-                    if config.image_provider == "placeholder":
+                    if scene_route["provider"] == "placeholder":
                         make_image_backend("placeholder").generate(
                             attempt_prompt,
                             config.llm_negative_prompt,
@@ -1299,13 +1551,23 @@ def stage_storyboard_and_image(
                             action=f"image {i + 1}/{len(plans)}",
                             timeout_seconds=image_timeout_seconds,
                         ):
-                            make_image_backend().generate(
-                                attempt_prompt,
-                                config.llm_negative_prompt,
-                                out,
-                                width=config.image_width,
-                                height=config.image_height,
-                            )
+                            if reference_paths:
+                                make_scene_reference_backend().generate_with_references(
+                                    attempt_prompt,
+                                    config.llm_negative_prompt,
+                                    reference_paths,
+                                    out,
+                                    width=config.image_width,
+                                    height=config.image_height,
+                                )
+                            else:
+                                make_image_backend().generate(
+                                    attempt_prompt,
+                                    config.llm_negative_prompt,
+                                    out,
+                                    width=config.image_width,
+                                    height=config.image_height,
+                                )
                     break
                 except Exception as exc:
                     last_exc = exc
@@ -1551,19 +1813,11 @@ def _ensure_upload_dependencies(on_log: LogFn = _noop) -> None:
 
 
 def _cover_provider() -> str:
-    provider = str(config.get("cover_provider", "same_as_image") or "").strip()
-    if provider in {"", "same_as_image", "同配图", "同图片"}:
-        return str(config.image_provider or "placeholder")
-    return provider
+    return _image_route_settings("cover")["provider"]
 
 
 def _cover_backend_settings() -> dict:
-    return {
-        "provider": _cover_provider(),
-        "base_url": str(config.get("cover_base_url", "") or config.image_base_url or ""),
-        "api_key": str(config.get("cover_api_key", "") or config.image_api_key or ""),
-        "model": str(config.get("cover_model", "") or config.image_model or ""),
-    }
+    return _image_route_settings("cover")
 
 
 def _cover_excerpt(novel: Novel, segments: list[Segment], limit: int = 900) -> str:
@@ -1871,7 +2125,7 @@ def stage_cover(
         model=cover_backend["model"],
         steps=config.image_steps,
         cfg=config.image_cfg,
-        workflow_path=config.image_workflow,
+        workflow_path=cover_backend.get("workflow_path", config.image_workflow),
         timeout_seconds=config.get("image_api_timeout_seconds", 300),
     )
     raw_tmp = raw_path.with_suffix(".tmp.png")
@@ -2387,6 +2641,8 @@ def run_full(
 
         segments = timed("3_clean", stage_clean, novel, on_log=log, job_dir=job_dir)
         _write_json(job_dir / "segments.json", [{"i": s.index, "text": s.text} for s in segments])
+        character_analysis = timed("4_character_analysis", stage_character_analysis, novel, segments, job_dir, on_log=log)
+        character_analysis = timed("4b_character_references", stage_character_references, character_analysis, job_dir, on_log=log)
         progress("tts", 0.15, title=novel.title)
 
         overlap_images = bool(config.get("pipeline_overlap_tts_images", True))
@@ -2412,6 +2668,7 @@ def run_full(
                 stage_storyboard_and_image,
                 prefetch_plans,
                 prefetch_dir,
+                character_analysis,
                 log,
                 lambda p: progress("images_prefetch", 0.18 + p * 0.28, title=novel.title),
             )
@@ -2433,6 +2690,7 @@ def run_full(
                             stage_storyboard_and_image,
                             plans,
                             job_dir,
+                            character_analysis,
                             on_log=log,
                             on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
                         )
@@ -2447,6 +2705,7 @@ def run_full(
                         stage_storyboard_and_image,
                         plans,
                         job_dir,
+                        character_analysis,
                         on_log=log,
                         on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
                     )
@@ -2472,6 +2731,7 @@ def run_full(
                 stage_storyboard_and_image,
                 plans,
                 job_dir,
+                character_analysis,
                 on_log=log,
                 on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
             )

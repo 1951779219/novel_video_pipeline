@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.18
+
+- Added automatic story and character analysis that writes per-job `character_profiles.json` with protagonists, supporting roles, fixed visual profiles, triggers, and task-level visual theme.
+- Added optional character reference image generation and `character_reference_manifest.json`, with desktop GUI controls for provider, model, dimensions, and prompt suffix.
+- Unified image routing for scene images, covers, character references, and scene-reference generation across ComfyUI, SDWebUI, OpenAI-compatible, custom, and placeholder providers.
+- Added OpenAI-compatible `/images/edits` and SDWebUI img2img reference-image paths so generated character references can be reused by scene generation when enabled.
+- Documented the Wenjing Huashi static-analysis takeaways and the character visual pipeline roadmap, and added a full-package helper script.
+
 ## v1.0.17
 
 - Align image API timeout defaults to 300 seconds across GUI, runner, and backend fallback paths so legacy or unset configs do not keep image requests waiting for the older 900-second default.

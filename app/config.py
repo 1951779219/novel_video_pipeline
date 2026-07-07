@@ -15,7 +15,7 @@ JOBS_DIR.mkdir(exist_ok=True)
 PROFILES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 6
+SETTINGS_SCHEMA_VERSION = 7
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "💥【爆款短文】《{clean_title}》{intro} #小说 #推文"
 DEFAULT_YOUTUBE_DESCRIPTION = (
     "原创内容，只只推文，每天更新高分又好看的#AI漫画#小说推文\n"
@@ -80,6 +80,32 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "必须保留所有剧情、对白、心理描写、旁白、世界观叙事。"
         "只返回 JSON，格式为 {\"remove\":[段落编号]}，不要解释。"
     ),
+
+    "character_analysis_enabled": False,
+    "character_analysis_max_chars": 12000,
+    "character_analysis_max_tokens": 1800,
+    "character_analysis_max_characters_per_prompt": 4,
+    "character_analysis_always_include_protagonists": True,
+    "character_analysis_prompt": "",
+    "character_reference_enabled": False,
+    "character_reference_provider": "same_as_image",
+    "character_reference_base_url": "",
+    "character_reference_api_key": "",
+    "character_reference_model": "",
+    "character_reference_workflow": "",
+    "character_reference_width": 768,
+    "character_reference_height": 1024,
+    "character_reference_max_count": 6,
+    "character_reference_prompt_suffix": "",
+    "scene_inject_visual_theme": True,
+    "scene_inject_character_triggers": True,
+    "scene_reference_enabled": False,
+    "scene_reference_provider": "same_as_image",
+    "scene_reference_base_url": "",
+    "scene_reference_api_key": "",
+    "scene_reference_model": "",
+    "scene_reference_workflow": "",
+    "scene_reference_max_images": 2,
 
     # TTS
     "tts_provider": "edge",  # edge / voicevox / azure / openai / elevenlabs / custom

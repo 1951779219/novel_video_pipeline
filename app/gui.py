@@ -329,6 +329,31 @@ class PipelineGUI:
         check("AI 扫文清理", "ai_text_clean_enabled")
         row("扫文批大小", "ai_text_clean_batch_chars", "6000")
         textrow("扫文清理提示词", "ai_text_clean_prompt", str(config.get("ai_text_clean_prompt", "")), height=4)
+        check("自动人设分析", "character_analysis_enabled")
+        row("人设分析字数", "character_analysis_max_chars", "12000")
+        row("人设输出 tokens", "character_analysis_max_tokens", "1800")
+        row("每图注入人物数", "character_analysis_max_characters_per_prompt", "4")
+        check("主角始终注入", "character_analysis_always_include_protagonists")
+        textrow("人设分析提示词", "character_analysis_prompt", str(config.get("character_analysis_prompt", "")), height=4)
+        check("生成人设参考图", "character_reference_enabled")
+        combo("人设图 Provider", "character_reference_provider", ["same_as_image", "placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "same_as_image")
+        row("人设图 Base URL", "character_reference_base_url", "")
+        row("人设图 API Key", "character_reference_api_key", "")
+        model_combo("人设图模型名", "character_reference_model", "", ["gpt-image-1", "flux", "sdxl"])
+        row("人设图 workflow", "character_reference_workflow", "")
+        row("人设图宽", "character_reference_width", "768")
+        row("人设图高", "character_reference_height", "1024")
+        row("最多人设图", "character_reference_max_count", "6")
+        row("人设图提示词后缀", "character_reference_prompt_suffix", "")
+        check("注入任务主题", "scene_inject_visual_theme")
+        check("注入角色触发词", "scene_inject_character_triggers")
+        check("场景图使用参考图", "scene_reference_enabled")
+        combo("场景参考 Provider", "scene_reference_provider", ["same_as_image", "comfyui", "sdwebui", "openai", "custom"], "same_as_image")
+        row("场景参考 Base URL", "scene_reference_base_url", "")
+        row("场景参考 API Key", "scene_reference_api_key", "")
+        model_combo("场景参考模型名", "scene_reference_model", "", ["gpt-image-1", "flux", "sdxl"])
+        row("场景参考 workflow", "scene_reference_workflow", "")
+        row("场景参考图数量", "scene_reference_max_images", "2")
         combo("图片 Provider", "image_provider", ["placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "placeholder")
         row("图片 Base URL/中转", "image_base_url", "")
         row("图片 API Key", "image_api_key", "")
@@ -430,6 +455,10 @@ class PipelineGUI:
         int_keys = {
             "pacing_fixed_count", "video_width", "video_height", "video_fps",
             "video_encoder_quality", "ai_text_clean_batch_chars",
+            "character_analysis_max_chars", "character_analysis_max_tokens",
+            "character_analysis_max_characters_per_prompt",
+            "character_reference_width", "character_reference_height", "character_reference_max_count",
+            "scene_reference_max_images",
             "image_api_timeout_seconds", "tts_segment_timeout_seconds", "tts_heartbeat_seconds",
             "max_concurrent_jobs", "max_concurrent_external_api", "max_concurrent_ffmpeg",
             "max_parallel_tts", "max_parallel_images", "max_parallel_video_clips",
@@ -448,6 +477,9 @@ class PipelineGUI:
             "video_long_mode", "ken_burns", "video_subtitle", "video_external_subtitle",
             "upload_enabled", "cover_enabled", "video_subtitle_bold", "video_subtitle_italic",
             "short_title_enabled", "pipeline_overlap_tts_images", "ai_text_clean_enabled",
+            "character_analysis_enabled", "character_analysis_always_include_protagonists",
+            "character_reference_enabled", "scene_inject_visual_theme", "scene_inject_character_triggers",
+            "scene_reference_enabled",
             "hardware_autotune_enabled",
             "dependency_check_on_startup", "dependency_auto_install_python",
             "dependency_auto_install_ffmpeg", "dependency_auto_install_browser",
