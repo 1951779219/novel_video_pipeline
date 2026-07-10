@@ -7,6 +7,8 @@
   - elevenlabs (ElevenLabs)
   - custom     (自定义 OpenAI 兼容 audio/speech 端点)
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -15,9 +17,12 @@ import sys
 import tempfile
 import wave
 import contextlib
+import re
 from pathlib import Path
 
 import httpx
+from app.utils.http import http_post
+from app.utils.secrets import clean_api_key
 
 
 class TTSBackend:
@@ -27,7 +32,7 @@ class TTSBackend:
         self.provider = provider
         self.voice = voice
         self.rate = rate
-        self.api_key = api_key
+        self.api_key = clean_api_key(api_key)
         self.base_url = base_url.rstrip("/") if base_url else ""
         self.extra = extra or {}
         self.volume = _volume_multiplier(volume)
@@ -123,12 +128,16 @@ class TTSBackend:
         base = self.base_url or "http://127.0.0.1:50021"
         speaker = int(self.voice) if str(self.voice).isdigit() else 1
         # 1) audio_query
-        q = httpx.post(f"{base}/audio_query", params={"text": text, "speaker": speaker}, timeout=min(60.0, self.timeout_seconds))
+        q = http_post(f"{base}/audio_query", params={"text": text, "speaker": speaker}, timeout=min(60.0, self.timeout_seconds))
         q.raise_for_status()
         # 2) synthesis
-        s = httpx.post(f"{base}/synthesis", params={"speaker": speaker},
-                       headers={"Content-Type": "application/json"},
-                       content=q.content, timeout=self.timeout_seconds)
+        s = http_post(
+            f"{base}/synthesis",
+            params={"speaker": speaker},
+            headers={"Content-Type": "application/json"},
+            content=q.content,
+            timeout=self.timeout_seconds,
+        )
         s.raise_for_status()
         out_path.write_bytes(s.content)
 
@@ -146,7 +155,7 @@ class TTSBackend:
         instructions = self.extra.get("instructions") or self.extra.get("emotion") or ""
         if instructions:
             payload["instructions"] = str(instructions)
-        r = httpx.post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
+        r = http_post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
         r.raise_for_status()
         out_path.write_bytes(r.content)
 
@@ -164,7 +173,7 @@ class TTSBackend:
             "Content-Type": "application/ssml+xml",
             "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
         }
-        r = httpx.post(url, content=ssml.encode("utf-8"), headers=headers, timeout=self.timeout_seconds)
+        r = http_post(url, content=ssml.encode("utf-8"), headers=headers, timeout=self.timeout_seconds)
         r.raise_for_status()
         out_path.write_bytes(r.content)
 
@@ -174,7 +183,7 @@ class TTSBackend:
         url = f"{base}/text-to-speech/{self.voice}"
         headers = {"xi-api-key": self.api_key, "Content-Type": "application/json"}
         payload = {"text": text, "model_id": self.extra.get("model", "eleven_multilingual_v2")}
-        r = httpx.post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
+        r = http_post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
         r.raise_for_status()
         out_path.write_bytes(r.content)
 
@@ -247,7 +256,7 @@ def _audio_duration(path: Path) -> float:
     """用 ffprobe 读时长（秒）。"""
     import subprocess
     from app.concurrency import media_probe_slot
-    from app.utils.ffmpeg import ffprobe_path
+    from app.utils.ffmpeg import ffmpeg_path, ffprobe_path
     try:
         with media_probe_slot(action="ffprobe"):
             r = subprocess.run(
@@ -255,7 +264,25 @@ def _audio_duration(path: Path) -> float:
                  "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
                 capture_output=True, text=True, timeout=20,
             )
-        return float(r.stdout.strip())
+        if r.returncode == 0 and r.stdout.strip():
+            return float(r.stdout.strip())
+    except Exception:
+        pass
+    try:
+        with media_probe_slot(action="ffmpeg duration"):
+            r = subprocess.run(
+                [ffmpeg_path(), "-hide_banner", "-i", str(path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=20,
+            )
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr or "")
+        if not match:
+            return 0.0
+        hours, minutes, seconds = match.groups()
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
     except Exception:
         return 0.0
 

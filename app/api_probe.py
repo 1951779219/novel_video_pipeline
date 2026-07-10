@@ -4,11 +4,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import tempfile
 import time
 from typing import Any
 
 import httpx
+from app.utils.http import http_client
+from app.utils.secrets import clean_api_key, redact_secret_text
 
 
 DEFAULT_BASES = {
@@ -72,6 +75,7 @@ def _join(base_url: str, path: str) -> str:
 
 def _bearer_headers(api_key: str) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
+    api_key = clean_api_key(api_key)
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
@@ -80,9 +84,9 @@ def _bearer_headers(api_key: str) -> dict[str, str]:
 def _http_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         response = exc.response
-        body = response.text[:500].replace("\n", " ")
+        body = redact_secret_text(response.text[:500].replace("\n", " "))
         return f"HTTP {response.status_code}: {body}"
-    return str(exc)
+    return redact_secret_text(exc)
 
 
 def _extract_model_ids(data: Any) -> list[str]:
@@ -126,7 +130,7 @@ def _openai_models(base_url: str, api_key: str, extra_headers: dict[str, str] | 
     if extra_headers:
         headers.update(extra_headers)
     endpoint = _join(base_url, "/models")
-    with httpx.Client(timeout=20.0, trust_env=True) as client:
+    with http_client(endpoint, timeout=20.0) as client:
         response = client.get(endpoint, headers=headers)
         response.raise_for_status()
         return _extract_model_ids(response.json()), endpoint
@@ -140,7 +144,7 @@ def _openai_chat_smoke(base_url: str, api_key: str, model: str) -> str:
         "max_tokens": 1,
         "temperature": 0,
     }
-    with httpx.Client(timeout=30.0, trust_env=True) as client:
+    with http_client(endpoint, timeout=30.0) as client:
         response = client.post(endpoint, headers=_bearer_headers(api_key), json=payload)
         response.raise_for_status()
     return endpoint
@@ -180,6 +184,7 @@ def probe_llm(provider: str, base_url: str, api_key: str, model: str) -> ProbeRe
 
 
 def _probe_claude(base_url: str, api_key: str, model: str) -> ProbeResult:
+    api_key = clean_api_key(api_key)
     if not api_key:
         return ProbeResult("分镜 LLM", "claude", False, endpoint=base_url, message="Claude 接口需要 API Key")
     headers = {
@@ -191,7 +196,7 @@ def _probe_claude(base_url: str, api_key: str, model: str) -> ProbeResult:
     models: list[str] = []
     endpoint = _join(base_url, "/models")
     try:
-        with httpx.Client(timeout=20.0, trust_env=True) as client:
+        with http_client(endpoint, timeout=20.0) as client:
             response = client.get(endpoint, headers=headers)
             response.raise_for_status()
             models = _extract_model_ids(response.json())
@@ -207,7 +212,7 @@ def _probe_claude(base_url: str, api_key: str, model: str) -> ProbeResult:
                 "messages": [{"role": "user", "content": "ping"}],
             }
             endpoint = _join(base_url, "/messages")
-            with httpx.Client(timeout=30.0, trust_env=True) as client:
+            with http_client(endpoint, timeout=30.0) as client:
                 response = client.post(endpoint, headers=headers, json=payload)
                 response.raise_for_status()
             return ProbeResult("分镜 LLM", "claude", True, endpoint, "模型列表和 messages 均可用", models, suggested, details)
@@ -223,7 +228,7 @@ def _probe_ollama(base_url: str, model: str) -> ProbeResult:
     models: list[str] = []
     endpoint = _join(root, "/api/tags")
     try:
-        with httpx.Client(timeout=10.0, trust_env=True) as client:
+        with http_client(endpoint, timeout=10.0) as client:
             response = client.get(endpoint)
             response.raise_for_status()
             data = response.json()
@@ -239,6 +244,7 @@ def _probe_ollama(base_url: str, model: str) -> ProbeResult:
 
 
 def probe_image(provider: str, base_url: str, api_key: str, model: str, name: str = "图片 API") -> ProbeResult:
+    api_key = clean_api_key(api_key)
     provider = str(provider or "placeholder").lower()
     if provider in {"same_as_image", "同配图", "同图片"}:
         provider = "same_as_image"
@@ -279,7 +285,7 @@ def _probe_sdwebui(base_url: str, name: str) -> ProbeResult:
     base = _base("sdwebui", base_url)
     endpoint = _join(base, "/sdapi/v1/sd-models")
     try:
-        with httpx.Client(timeout=20.0, trust_env=True) as client:
+        with http_client(endpoint, timeout=20.0) as client:
             response = client.get(endpoint)
             response.raise_for_status()
             data = response.json()
@@ -296,7 +302,7 @@ def _probe_comfyui(base_url: str, name: str) -> ProbeResult:
     models: list[str] = []
     endpoint = _join(base, "/system_stats")
     try:
-        with httpx.Client(timeout=20.0, trust_env=True) as client:
+        with http_client(endpoint, timeout=20.0) as client:
             response = client.get(endpoint)
             response.raise_for_status()
             details.append("system_stats 可访问")
@@ -316,11 +322,12 @@ def _probe_comfyui(base_url: str, name: str) -> ProbeResult:
 
 
 def _probe_replicate(api_key: str, model: str, name: str) -> ProbeResult:
+    api_key = clean_api_key(api_key)
     endpoint = "https://api.replicate.com/v1/models"
     if not api_key:
         return ProbeResult(name, "replicate", False, endpoint, "Replicate 需要 API Token")
     try:
-        with httpx.Client(timeout=20.0, trust_env=True) as client:
+        with http_client(endpoint, timeout=20.0) as client:
             response = client.get(endpoint, headers={"Authorization": f"Token {api_key}"})
             response.raise_for_status()
             data = response.json()
@@ -338,6 +345,7 @@ def _probe_replicate(api_key: str, model: str, name: str) -> ProbeResult:
 
 
 def _probe_aliyun(api_key: str, model: str, name: str) -> ProbeResult:
+    api_key = clean_api_key(api_key)
     if not api_key:
         return ProbeResult(name, "aliyun", False, "https://dashscope.aliyuncs.com", "阿里云 DashScope 需要 API Key")
     models = ["wanx-v1"]
@@ -346,6 +354,7 @@ def _probe_aliyun(api_key: str, model: str, name: str) -> ProbeResult:
 
 
 def probe_tts(provider: str, base_url: str, api_key: str, voice: str, model: str) -> ProbeResult:
+    api_key = clean_api_key(api_key)
     provider = str(provider or "edge").lower()
     if provider == "silent":
         return ProbeResult("TTS API", provider, True, message="silent 是本地静音占位，不需要外部 API")
@@ -417,7 +426,7 @@ def _probe_voicevox(base_url: str) -> ProbeResult:
     base = _base("voicevox", base_url)
     endpoint = _join(base, "/speakers")
     try:
-        with httpx.Client(timeout=20.0, trust_env=True) as client:
+        with http_client(endpoint, timeout=20.0) as client:
             version_resp = client.get(_join(base, "/version"))
             version = version_resp.text.strip() if version_resp.status_code == 200 else ""
             response = client.get(endpoint)
@@ -440,7 +449,7 @@ def _probe_elevenlabs(base_url: str, api_key: str, voice: str) -> ProbeResult:
         return ProbeResult("TTS API", "elevenlabs", False, endpoint, "ElevenLabs 需要 API Key")
     try:
         headers = {"xi-api-key": api_key}
-        with httpx.Client(timeout=20.0, trust_env=True) as client:
+        with http_client(endpoint, timeout=20.0) as client:
             response = client.get(endpoint, headers=headers)
             response.raise_for_status()
             data = response.json()

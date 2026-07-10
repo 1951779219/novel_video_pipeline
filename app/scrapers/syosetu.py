@@ -10,7 +10,7 @@ import time
 import httpx
 from selectolax.parser import HTMLParser
 
-from .base import Novel, NovelChapter
+from .base import BookSearchResult, Novel, NovelChapter
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 _HEADERS = {"User-Agent": UA, "Accept-Language": "ja,en;q=0.8"}
@@ -121,6 +121,53 @@ class SyosetuScraper:
         r = self._client.get(url)
         r.raise_for_status()
         return r.text
+
+    # ─────────────────────────────────────────────
+    # 关键词搜索（官方 novelapi）
+    # ─────────────────────────────────────────────
+    def search(self, keyword: str, limit: int = 20) -> list[BookSearchResult]:
+        key = (keyword or "").strip()
+        if not key:
+            raise ValueError("搜索关键词不能为空")
+        params = {
+            "out": "json",
+            "word": key,
+            "lim": str(max(1, min(int(limit or 20), 50))),
+            "of": "t-n-w-s-gp-gl-nu",
+        }
+        r = self._client.get("https://api.syosetu.com/novelapi/api/", params=params)
+        r.raise_for_status()
+        data = r.json()
+        results: list[BookSearchResult] = []
+        for item in data[1:]:
+            if not isinstance(item, dict):
+                continue
+            ncode = str(item.get("ncode") or "").lower().strip()
+            title = str(item.get("title") or "").strip()
+            if not ncode or not title:
+                continue
+            genre = str(item.get("genre") or "").strip()
+            points = str(item.get("global_point") or "").strip()
+            updated = str(item.get("novelupdated_at") or "").strip()
+            latest = f"更新 {updated}" if updated else ""
+            if points:
+                latest = f"{latest} / {points}pt" if latest else f"{points}pt"
+            results.append(
+                BookSearchResult(
+                    title=title,
+                    author=str(item.get("writer") or ""),
+                    source="小説家になろう",
+                    content_type=f"ジャンル {genre}" if genre else "原创网络小说",
+                    paid_label="免费",
+                    region="japanese",
+                    intro=str(item.get("story") or ""),
+                    latest_chapter=latest,
+                    word_count=str(item.get("length") or ""),
+                    ref=f"https://ncode.syosetu.com/{ncode}/",
+                    raw=item,
+                )
+            )
+        return results
 
     # ─────────────────────────────────────────────
     # 排行榜（官方 API，免认证）

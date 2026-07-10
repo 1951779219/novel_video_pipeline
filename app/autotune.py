@@ -4,7 +4,10 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import platform
+import re
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -71,12 +74,17 @@ def run_startup_autotune(*, force: bool = False) -> tuple[bool, dict[str, Any]]:
 
 
 def quick_hardware_snapshot() -> dict[str, Any]:
+    mac_info = _detect_macos_hardware()
     nvidia_gpus = _detect_nvidia_smi()
     wmi_gpu_names = _detect_windows_gpu_names()
-    gpu_names = [g["name"] for g in nvidia_gpus] + [
+    gpu_names = list(mac_info.get("gpu_names") or []) + [g["name"] for g in nvidia_gpus] + [
         name for name in wmi_gpu_names if name and name not in {g["name"] for g in nvidia_gpus}
     ]
     return {
+        "platform": sys.platform,
+        "machine_name": mac_info.get("machine_name", ""),
+        "chip_type": mac_info.get("chip_type", ""),
+        "gpu_cores": mac_info.get("gpu_cores", 0),
         "cpu_threads": max(1, int(os.cpu_count() or 1)),
         "ram_gb": _total_ram_gb(),
         "gpu_names": gpu_names,
@@ -86,6 +94,9 @@ def quick_hardware_snapshot() -> dict[str, Any]:
 def hardware_signature(snapshot: dict[str, Any]) -> str:
     gpu_names = sorted({str(name).strip().lower() for name in snapshot.get("gpu_names", []) if str(name).strip()})
     signature = {
+        "platform": str(snapshot.get("platform") or sys.platform),
+        "machine_name": str(snapshot.get("machine_name") or ""),
+        "chip_type": str(snapshot.get("chip_type") or ""),
         "cpu_threads": int(snapshot.get("cpu_threads") or 1),
         "ram_gb": round(float(snapshot.get("ram_gb") or 0.0), 1),
         "gpu_names": gpu_names[:6],
@@ -96,9 +107,10 @@ def hardware_signature(snapshot: dict[str, Any]) -> str:
 def scan_hardware() -> dict[str, Any]:
     cpu_threads = max(1, int(os.cpu_count() or 1))
     ram_gb = _total_ram_gb()
+    mac_info = _detect_macos_hardware()
     nvidia_gpus = _detect_nvidia_smi()
     wmi_gpu_names = _detect_windows_gpu_names()
-    gpu_names = [g["name"] for g in nvidia_gpus] + [
+    gpu_names = list(mac_info.get("gpu_names") or []) + [g["name"] for g in nvidia_gpus] + [
         name for name in wmi_gpu_names if name and name not in {g["name"] for g in nvidia_gpus}
     ]
     gpu_text = " ".join(gpu_names).lower()
@@ -112,9 +124,13 @@ def scan_hardware() -> dict[str, Any]:
         encoder_candidates.append("h264_qsv")
     if "amd" in gpu_text or "radeon" in gpu_text:
         encoder_candidates.append("h264_amf")
+    if sys.platform == "darwin":
+        encoder_candidates.append("h264_videotoolbox")
     for encoder in ("h264_nvenc", "h264_qsv", "h264_amf"):
         if encoder in encoders_text and encoder not in encoder_candidates:
             encoder_candidates.append(encoder)
+    if "h264_videotoolbox" in encoders_text and "h264_videotoolbox" not in encoder_candidates:
+        encoder_candidates.append("h264_videotoolbox")
 
     encoder_tests: dict[str, bool] = {}
     for encoder in encoder_candidates[:3]:
@@ -125,13 +141,16 @@ def scan_hardware() -> dict[str, Any]:
 
     hardware_encoder = next((name for name, ok in encoder_tests.items() if ok), "")
     return {
+        "platform": sys.platform,
+        "os_name": _macos_version() if sys.platform == "darwin" else platform.platform(),
+        **mac_info,
         "cpu_threads": cpu_threads,
         "ram_gb": ram_gb,
         "gpu_names": gpu_names,
         "nvidia_gpus": nvidia_gpus,
         "ffmpeg": ffmpeg_bin,
         "ffmpeg_encoders_available": sorted(
-            name for name in ("h264_nvenc", "h264_qsv", "h264_amf") if name in encoders_text
+            name for name in ("h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox") if name in encoders_text
         ),
         "encoder_tests": encoder_tests,
         "hardware_encoder": hardware_encoder,
@@ -143,6 +162,39 @@ def recommend_settings(snapshot: dict[str, Any]) -> dict[str, Any]:
     ram_gb = float(snapshot.get("ram_gb") or 0.0)
     hardware_encoder = str(snapshot.get("hardware_encoder") or "")
     has_hw = bool(hardware_encoder)
+
+    if str(snapshot.get("platform") or "") == "darwin":
+        if cpu_threads >= 16 and ram_gb >= 64:
+            tts_workers = 4
+            image_workers = 3
+            ffmpeg_workers = 2
+            probe_workers = 4
+        elif cpu_threads >= 8 and ram_gb >= 16:
+            tts_workers = 3
+            image_workers = 2
+            ffmpeg_workers = 1
+            probe_workers = 3
+        else:
+            tts_workers = 1
+            image_workers = 1
+            ffmpeg_workers = 1
+            probe_workers = 1
+        external_api_slots = max(1, min(4, max(tts_workers, image_workers)))
+        video_clip_workers = max(1, min(2, ffmpeg_workers))
+        return {
+            "video_encoder": hardware_encoder or "libx264",
+            "video_encoder_preset": "realtime" if hardware_encoder == "h264_videotoolbox" else "veryfast",
+            "video_encoder_quality": 24,
+            "max_concurrent_jobs": 1,
+            "max_concurrent_external_api": external_api_slots,
+            "max_concurrent_ffmpeg": ffmpeg_workers,
+            "max_concurrent_media_probe": probe_workers,
+            "max_parallel_tts": tts_workers,
+            "max_parallel_images": image_workers,
+            "max_parallel_video_clips": video_clip_workers,
+            "pipeline_overlap_tts_images": True,
+            "worker_detached": True,
+        }
 
     if cpu_threads <= 4 or ram_gb < 8:
         tts_workers = 1
@@ -197,6 +249,22 @@ def build_summary(snapshot: dict[str, Any], settings: dict[str, Any]) -> str:
     cpu_threads = int(snapshot.get("cpu_threads") or 1)
     ram_gb = float(snapshot.get("ram_gb") or 0.0)
     gpu_names = snapshot.get("gpu_names") or []
+    if str(snapshot.get("platform") or "") == "darwin":
+        machine = str(snapshot.get("machine_name") or "Mac")
+        chip = str(snapshot.get("chip_type") or "").strip()
+        gpu_cores = int(snapshot.get("gpu_cores") or 0)
+        unified = "统一内存" if bool(snapshot.get("unified_memory", True)) else "内存"
+        gpu_text = str(gpu_names[0]) if gpu_names else (chip or "Apple GPU")
+        gpu_suffix = f"，GPU {gpu_cores} 核" if gpu_cores else ""
+        machine_text = f"{machine} {chip}".strip()
+        hw_note = "VideoToolbox 硬编可用" if settings.get("video_encoder") == "h264_videotoolbox" else "VideoToolbox 未通过，使用 CPU 编码"
+        return (
+            f"识别到 Mac：{machine_text or 'Mac'}，CPU {cpu_threads} 线程，{unified} {ram_gb:.1f}GB，"
+            f"GPU {gpu_text}{gpu_suffix}；{hw_note}：{settings.get('video_encoder')}；"
+            f"推荐并发：API {settings.get('max_concurrent_external_api')}，FFmpeg {settings.get('max_concurrent_ffmpeg')}，"
+            f"TTS {settings.get('max_parallel_tts')}，图片 {settings.get('max_parallel_images')}，"
+            f"视频片段 {settings.get('max_parallel_video_clips')}。"
+        )
     gpu_text = " / ".join(str(x) for x in gpu_names[:3]) if gpu_names else "未识别到独立显卡"
     encoder = str(settings.get("video_encoder") or "libx264")
     hw_note = "硬编可用" if encoder != "libx264" else "硬编未通过，使用 CPU 编码"
@@ -209,6 +277,13 @@ def build_summary(snapshot: dict[str, Any], settings: dict[str, Any]) -> str:
 
 
 def _total_ram_gb() -> float:
+    if sys.platform == "darwin":
+        proc = _run(["sysctl", "-n", "hw.memsize"], timeout=3)
+        if proc.returncode == 0:
+            try:
+                return round(float(proc.stdout.strip()) / (1024 ** 3), 1)
+            except Exception:
+                pass
     if os.name == "nt":
         try:
             class MemoryStatusEx(ctypes.Structure):
@@ -286,6 +361,69 @@ def _detect_windows_gpu_names() -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
+def _macos_version() -> str:
+    proc = _run(["sw_vers", "-productVersion"], timeout=3)
+    if proc.returncode == 0 and proc.stdout.strip():
+        return f"macOS {proc.stdout.strip()}"
+    return "macOS"
+
+
+def _detect_macos_hardware() -> dict[str, Any]:
+    if sys.platform != "darwin":
+        return {}
+    info: dict[str, Any] = {
+        "machine_name": "",
+        "machine_model": "",
+        "chip_type": _sysctl_value("machdep.cpu.brand_string"),
+        "gpu_names": [],
+        "gpu_cores": 0,
+        "metal": False,
+        "unified_memory": True,
+    }
+    proc = _run(["system_profiler", "SPHardwareDataType", "SPDisplaysDataType", "-json"], timeout=15)
+    if proc.returncode == 0 and proc.stdout.strip():
+        try:
+            data = json.loads(proc.stdout)
+        except Exception:
+            data = {}
+        hardware = (data.get("SPHardwareDataType") or [{}])[0]
+        if isinstance(hardware, dict):
+            info["machine_name"] = str(hardware.get("machine_name") or "")
+            info["machine_model"] = str(hardware.get("machine_model") or "")
+            info["chip_type"] = str(hardware.get("chip_type") or info["chip_type"] or "")
+            memory_text = str(hardware.get("physical_memory") or "")
+            match = re.search(r"([\d.]+)\s*GB", memory_text, re.I)
+            if match:
+                info["reported_memory_gb"] = float(match.group(1))
+        display_rows = data.get("SPDisplaysDataType") or []
+        gpu_names: list[str] = []
+        for row in display_rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("sppci_model") or row.get("_name") or "").strip()
+            if name and name not in gpu_names:
+                gpu_names.append(name)
+            cores = str(row.get("sppci_cores") or "").strip()
+            if cores.isdigit():
+                info["gpu_cores"] = max(int(info.get("gpu_cores") or 0), int(cores))
+            metal = str(row.get("spdisplays_mtlgpufamilysupport") or "").strip()
+            if metal:
+                info["metal"] = True
+        info["gpu_names"] = gpu_names
+    if not info.get("machine_name"):
+        info["machine_name"] = _sysctl_value("hw.model") or "Mac"
+    if not info.get("chip_type"):
+        info["chip_type"] = _sysctl_value("machdep.cpu.brand_string")
+    if not info.get("gpu_names") and info.get("chip_type"):
+        info["gpu_names"] = [str(info["chip_type"])]
+    return info
+
+
+def _sysctl_value(name: str) -> str:
+    proc = _run(["sysctl", "-n", name], timeout=3)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
 def _ffmpeg_encoders(ffmpeg_bin: str) -> str:
     proc = _run([ffmpeg_bin, "-hide_banner", "-encoders"], timeout=8)
     if proc.returncode != 0:
@@ -301,6 +439,8 @@ def _smoke_test_encoder(ffmpeg_bin: str, encoder: str) -> bool:
         args = ["-vf", "format=nv12", "-c:v", "h264_qsv", "-global_quality", "26", "-pix_fmt", "yuv420p"]
     elif encoder == "h264_amf":
         args = ["-c:v", "h264_amf", "-quality", "speed", "-qp_i", "26", "-qp_p", "26", "-pix_fmt", "yuv420p"]
+    elif encoder == "h264_videotoolbox":
+        args = ["-c:v", "h264_videotoolbox", "-q:v", "45", "-pix_fmt", "yuv420p"]
     else:
         return False
 
@@ -328,7 +468,9 @@ def _smoke_test_encoder(ffmpeg_bin: str, encoder: str) -> bool:
 
 
 def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         return subprocess.run(
             args,
@@ -338,7 +480,7 @@ def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
             encoding="utf-8",
             errors="ignore",
             timeout=timeout,
-            creationflags=flags,
+            **kwargs,
         )
     except Exception as exc:
         return subprocess.CompletedProcess(args, 1, "", str(exc))

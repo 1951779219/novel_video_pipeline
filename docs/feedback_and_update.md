@@ -53,9 +53,11 @@ tools/feedback_daily.py
 3. GitHub Actions 自动分类、标优先级和模块。
 4. 每日巡检 workflow 生成维护报告。
 5. Codex 自动维护任务读取反馈和报告，多智能体分析，能安全修复时提交改动。
-6. 修复后修改 `app/version.py` 和 `CHANGELOG.md`，推送 `v*` 标签。
-7. 发布 workflow 生成 `latest.json` 和更新 zip。
-8. 软件读取 `latest.json`，用户在“软件更新”页下载并应用。
+6. 修复后修改 `app/version.py`，运行验证。
+7. 运行 `scripts/publish_github_release.sh`，生成脱敏更新包和 `latest.json` 并上传 GitHub Release。
+8. 软件读取 `latest.json`，用户在“软件更新”页下载并应用。macOS 更新器会保护 `data/settings.json`、`data/profiles/`、任务和浏览器登录态。
+
+具体发布步骤见 `docs/online_update_github.md`。
 
 自动修复护栏：
 

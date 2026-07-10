@@ -1,6 +1,6 @@
 """Lightweight cross-process resource slots.
 
-The WebUI can dispatch long-running worker processes. In-process semaphores do
+The desktop GUI can dispatch long-running worker processes. In-process semaphores do
 not protect ordinary PCs once multiple workers exist, so this module uses small
 lock files under data/runtime/locks. Stale locks are cleaned by checking whether
 the owning PID is still alive.

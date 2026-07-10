@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -151,10 +152,34 @@ def _safe_extract(zf: zipfile.ZipFile, target: Path) -> None:
 
 def launch_update(zip_path: Path, version: str, target_dir: Path | None = None) -> None:
     target = target_dir or app_root()
+    script = target / "scripts" / "apply_update.py"
+    if script.exists():
+        args = [
+            sys.executable,
+            str(script),
+            "--zip",
+            str(zip_path),
+            "--target",
+            str(target),
+            "--version",
+            str(version),
+            "--wait",
+            "2",
+        ]
+        kwargs: dict[str, Any] = {"cwd": str(target)}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(args, **kwargs)
+        return
+
     extract_dir = extract_update(zip_path, version)
     bat = extract_dir / "update.bat"
     if not bat.exists():
-        raise UpdateError("更新包内缺少 update.bat")
+        raise UpdateError("更新包内缺少 update.bat，且当前安装包没有 scripts/apply_update.py")
+    if os.name != "nt":
+        raise UpdateError("当前安装包只提供 Windows update.bat；请先安装带 macOS 更新器的新版本")
     subprocess.Popen(
         ["cmd", "/c", str(bat), str(target)],
         cwd=str(extract_dir),

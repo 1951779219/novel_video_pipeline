@@ -30,6 +30,9 @@ class BookSearchResult:
     ref: str
     author: str = ""
     source: str = ""
+    content_type: str = ""
+    paid_label: str = ""
+    region: str = ""
     intro: str = ""
     latest_chapter: str = ""
     word_count: str = ""

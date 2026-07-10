@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import subprocess
+import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -104,6 +105,8 @@ def _video_encoder_args(encoder: str, preset: str = "veryfast", quality: int | f
         return ["-c:v", "h264_qsv", "-global_quality", quality_value, "-pix_fmt", "yuv420p"]
     if enc in {"h264_amf", "amf", "amd"}:
         return ["-c:v", "h264_amf", "-quality", "speed", "-qp_i", quality_value, "-qp_p", quality_value, "-pix_fmt", "yuv420p"]
+    if enc in {"h264_videotoolbox", "videotoolbox", "apple"}:
+        return ["-c:v", "h264_videotoolbox", "-q:v", quality_value, "-pix_fmt", "yuv420p"]
     x264_preset = str(preset or "veryfast").strip().lower()
     if x264_preset not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
         x264_preset = "veryfast"
@@ -112,7 +115,20 @@ def _video_encoder_args(encoder: str, preset: str = "veryfast", quality: int | f
 
 def _is_hardware_encoder(encoder: str) -> bool:
     enc = str(encoder or "").strip().lower()
-    return enc in {"h264_nvenc", "nvenc", "nvidia", "h264_qsv", "qsv", "intel", "h264_amf", "amf", "amd"}
+    return enc in {
+        "h264_nvenc",
+        "nvenc",
+        "nvidia",
+        "h264_qsv",
+        "qsv",
+        "intel",
+        "h264_amf",
+        "amf",
+        "amd",
+        "h264_videotoolbox",
+        "videotoolbox",
+        "apple",
+    }
 
 
 def _run_encoder_command(
@@ -558,11 +574,23 @@ def _build_video_from_clips(
 
 def _ass_filter(path: Path) -> str:
     ass_path = path.resolve().as_posix().replace(":", r"\:").replace("'", r"\'")
-    fonts_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    fonts_dir = _default_fonts_dir()
     if fonts_dir.exists():
         fonts = fonts_dir.resolve().as_posix().replace(":", r"\:").replace("'", r"\'")
         return f"ass='{ass_path}':fontsdir='{fonts}'"
     return f"ass='{ass_path}'"
+
+
+def _default_fonts_dir() -> Path:
+    if sys.platform == "darwin":
+        for path in (
+            Path("/System/Library/Fonts"),
+            Path("/Library/Fonts"),
+            Path.home() / "Library" / "Fonts",
+        ):
+            if path.exists():
+                return path
+    return Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 
 
 def build_ass(

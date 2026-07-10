@@ -7,8 +7,13 @@ Stage 5 (浏览器上传): 用 Playwright 通过 CDP 连接已打开的 Chrome
   精简流程（flow=simple）：直接跳公开范围页 → 自动发布
   完整流程（flow=full）：设置权利管理 → 创收/广告位 → 分级 → 发布
 """
+from __future__ import annotations
+
 import re
 import json
+import os
+import shutil
+import sys
 import time
 import socket
 import subprocess
@@ -16,30 +21,59 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    from app.youtube_ad_suitability import normalize_ad_suitability_template
+except Exception:
+    try:
+        from ..youtube_ad_suitability import normalize_ad_suitability_template
+    except Exception:
+        def normalize_ad_suitability_template(template=None):
+            if isinstance(template, dict):
+                questions = template.get("questions")
+                return {
+                    "default": int(template.get("default", 1) or 1),
+                    "questions": questions if isinstance(questions, dict) else {},
+                }
+            if isinstance(template, str) and template.strip():
+                try:
+                    data = json.loads(template)
+                    if isinstance(data, dict):
+                        questions = data.get("questions")
+                        return {
+                            "default": int(data.get("default", 1) or 1),
+                            "questions": questions if isinstance(questions, dict) else {},
+                        }
+                except Exception:
+                    pass
+            return {"default": 1, "questions": {}}
+
 _DEBUG_PORT = 9222
-
-
-def _is_browser_disconnect_error(exc_or_text) -> bool:
-    text = str(exc_or_text or "").lower()
-    needles = (
-        "target page, context or browser has been closed",
-        "connection closed",
-        "websocket",
-        "targetclosederror",
-        "browser has been closed",
-        "browser has been disconnected",
-        "connection reset",
-        "protocol error",
-    )
-    return any(needle in text for needle in needles)
-
-
 _STALL = "STALL"   # 标志：上传卡住，需要外层重启浏览器
+
+
+class _UploadPolicyConfirmError(RuntimeError):
+    """Upload policy did not stick; refresh Studio and restart the upload flow."""
 
 
 def _activate_chrome_window():
     """将 Chrome 主窗口激活到前台，确保原生文件对话框能正常弹出。
     用 keybd_event 模拟按键解除 Windows 对 SetForegroundWindow 的限制。"""
+    if sys.platform == "darwin":
+        for app_name in ("Google Chrome", "Google Chrome for Testing", "Chromium"):
+            try:
+                subprocess.run(
+                    ["osascript", "-e", f'tell application "{app_name}" to activate'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    check=True,
+                )
+                return True
+            except Exception:
+                continue
+        return False
+    if os.name != "nt":
+        return False
     import ctypes
     import ctypes.wintypes
 
@@ -108,45 +142,147 @@ class _Delays:
 # ─────────────────────────────────────────────────────────────
 
 def _find_chrome_exe() -> Optional[str]:
-    import os
-    candidates = [
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]
+    candidates = []
+    found = (
+        shutil.which("google-chrome")
+        or shutil.which("chrome")
+        or shutil.which("chromium")
+        or shutil.which("chrome.exe")
+    )
+    if found:
+        candidates.append(found)
+    if os.name == "nt":
+        candidates.extend(
+            [
+                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            ]
+        )
+    elif sys.platform == "darwin":
+        candidates.extend(
+            [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                str(Path.home() / "Applications" / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"),
+                "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                str(Path.home() / "Applications" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"),
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                str(Path.home() / "Applications" / "Chromium.app" / "Contents" / "MacOS" / "Chromium"),
+            ]
+        )
     for c in candidates:
         if Path(c).exists():
             return c
+    playwright_chromium = _find_playwright_chromium_exe()
+    if playwright_chromium:
+        return playwright_chromium
     return None
 
 
-def _kill_chrome():
+def _find_playwright_chromium_exe() -> Optional[str]:
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as pw:
+            path = Path(pw.chromium.executable_path)
+        if path.exists():
+            return str(path)
+    except Exception:
+        return None
+    return None
+
+
+def _safe_chrome_profile_name(name: str) -> str:
+    raw = str(name or "").strip() or "Default"
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", raw).strip(" ._")
+    return (safe or "Default")[:64]
+
+
+def _chrome_debug_profile_dir(config, profile_name: str = "") -> Path:
+    name = _safe_chrome_profile_name(profile_name or getattr(config, "browser_chrome_profile", "Default"))
+    data_dir = Path(__file__).parent.parent.parent / "data"
+    if name.lower() == "default":
+        return data_dir / "chrome_debug_profile"
+    return data_dir / "chrome_debug_profiles" / name
+
+
+def _kill_chrome(profile_dir: Optional[Path] = None):
+    if os.name != "nt":
+        try:
+            subprocess.run(
+                ["pkill", "-f", f"remote-debugging-port={_DEBUG_PORT}"],
+                capture_output=True,
+                timeout=10,
+            )
+            if profile_dir is not None:
+                subprocess.run(
+                    ["pkill", "-f", str(profile_dir)],
+                    capture_output=True,
+                    timeout=10,
+                )
+        except Exception:
+            pass
+        return
+
+    matched = False
+    profile_text = str(profile_dir).replace("\\", "\\\\") if profile_dir else ""
+    ps = (
+        "$items = Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+        "Where-Object { "
+        "$_.CommandLine -like '*--remote-debugging-port=9222*' "
+        "-or $_.CommandLine -like '*chrome_debug_profile*' "
+        "-or $_.CommandLine -like '*chrome_debug_profiles*'"
+    )
+    if profile_text:
+        ps += f" -or $_.CommandLine -like '*{profile_text}*'"
+    ps += (
+        " }; "
+        "$items | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "
+        "if ($items) { 'killed' }"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000,
+        )
+        matched = "killed" in (r.stdout or "")
+    except Exception:
+        pass
+    if matched:
+        return
+    if profile_dir is not None:
+        return
     try:
         subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"],
-                       capture_output=True, timeout=10)
+                       capture_output=True, timeout=10, creationflags=0x08000000)
     except Exception:
         pass
 
 
-def _launch_chrome(config, on_log: Callable) -> bool:
+def _launch_chrome(config, on_log: Callable, profile_name: str = "") -> bool:
     """启动调试模式 Chrome，等端口就绪后再等页面基本加载完"""
     chrome = _find_chrome_exe()
     if not chrome:
         on_log("❌ 未找到 Chrome 可执行文件，无法自动重启")
         return False
-    profile = str(Path(__file__).parent.parent.parent / "data" / "chrome_debug_profile")
+    profile_dir = _chrome_debug_profile_dir(config, profile_name)
+    profile = str(profile_dir)
+    profile_label = _safe_chrome_profile_name(profile_name or getattr(config, "browser_chrome_profile", "Default"))
+    _clean_chrome_debug_profile_cache(profile_dir, on_log)
     cmd = [
         chrome,
         f"--remote-debugging-port={_DEBUG_PORT}",
         "--remote-allow-origins=*",
         f"--user-data-dir={profile}",
+        "--disable-features=PreloadMediaEngagementData,MediaRouter",
         "--no-first-run",
         "--no-default-browser-check",
         "https://studio.youtube.com",
     ]
     try:
         subprocess.Popen(cmd)
-        on_log("  Chrome 已启动，等待调试端口就绪...")
+        on_log(f"  Chrome 已启动（账号资料: {profile_label}），等待调试端口就绪...")
         for _ in range(30):
             time.sleep(0.5)
             if _is_port_open(_DEBUG_PORT):
@@ -160,19 +296,153 @@ def _launch_chrome(config, on_log: Callable) -> bool:
         return False
 
 
-def _restart_chrome(config, on_log: Callable) -> bool:
+def _clean_chrome_debug_profile_cache(profile_dir: Path, on_log: Callable | None = None):
+    """
+    Clear stale YouTube Studio frontend caches in the dedicated debug profile
+    while preserving Google login cookies.
+    """
+    import shutil
+
+    if not profile_dir.exists():
+        return
+    try:
+        resolved = profile_dir.resolve()
+        data_dir = (Path(__file__).parent.parent.parent / "data").resolve()
+        legacy = (data_dir / "chrome_debug_profile").resolve()
+        profiles_root = (data_dir / "chrome_debug_profiles").resolve()
+        if resolved != legacy and not resolved.is_relative_to(profiles_root):
+            return
+    except Exception:
+        return
+
+    rel_targets = [
+        "Default/Cache",
+        "Default/Code Cache",
+        "Default/GPUCache",
+        "Default/DawnGraphiteCache",
+        "Default/DawnWebGPUCache",
+        "Default/Service Worker",
+        "Default/Session Storage",
+        "Default/blob_storage",
+        "ShaderCache",
+        "GrShaderCache",
+        "GraphiteDawnCache",
+        "GPUPersistentCache",
+    ]
+    removed = 0
+    for rel in rel_targets:
+        target = profile_dir / rel
+        if not target.exists():
+            continue
+        try:
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink(missing_ok=True)
+            removed += 1
+        except Exception:
+            pass
+    if removed and on_log:
+        on_log(f"  已清理调试 Chrome 前端缓存 {removed} 项（保留登录状态）")
+
+
+def _reset_youtube_studio_runtime_cache(ctx, page, on_log: Callable | None = None):
+    """Reset Studio app cache for already-open debug Chrome sessions."""
+    try:
+        session = ctx.new_cdp_session(page)
+    except Exception:
+        return
+    try:
+        session.send("Network.clearBrowserCache")
+    except Exception:
+        pass
+    cleared = 0
+    for origin in (
+        "https://studio.youtube.com",
+        "https://www.youtube.com",
+        "https://youtube.com",
+    ):
+        try:
+            session.send("Storage.clearDataForOrigin", {
+                "origin": origin,
+                "storageTypes": "cache_storage,service_workers,shader_cache",
+            })
+            cleared += 1
+        except Exception:
+            pass
+    if cleared and on_log:
+        on_log("  已刷新 YouTube Studio 前端缓存（保留账号登录）")
+
+
+def _restart_chrome(config, on_log: Callable, profile_name: str = "") -> bool:
     on_log("⚙ 重启调试浏览器...")
-    _kill_chrome()
+    _kill_chrome(_chrome_debug_profile_dir(config, profile_name))
     time.sleep(2)
-    return _launch_chrome(config, on_log)
+    return _launch_chrome(config, on_log, profile_name)
 
 
 # ─────────────────────────────────────────────────────────────
-# 激活方案解析
+# 上传方案解析
 # ─────────────────────────────────────────────────────────────
 
-def _get_active_profile(config) -> dict:
-    """解析激活的上传方案，找不到时 fallback 到旧字段"""
+def _bool_profile_value(value, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"0", "false", "no", "off", "disabled"}:
+        return False
+    if text in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    return default
+
+
+def _legacy_profile(config) -> dict:
+    return {
+        "name": getattr(config, "browser_active_profile", "") or "Default",
+        "enabled": True,
+        "chrome_profile": getattr(config, "browser_chrome_profile", "Default") or "Default",
+        "flow": "full",
+        "upload_policy": getattr(config, "browser_upload_policy", "BTRA"),
+        "ad_interval": int(getattr(config, "browser_ad_interval", 60)),
+        "ad_start": int(getattr(config, "browser_ad_start", 0)),
+        "visibility": str(getattr(config, "browser_visibility", "PUBLIC")).strip().upper() or "PUBLIC",
+        "title_template": "",
+        "description": getattr(config, "youtube_description", ""),
+        "cover_prompt": getattr(config, "cover_prompt", ""),
+        "ad_suitability_template": getattr(config, "browser_ad_suitability_template", ""),
+    }
+
+
+def _normalize_profile(config, profile: dict, idx: int = 0) -> dict:
+    base = _legacy_profile(config)
+    if not isinstance(profile, dict):
+        profile = {}
+    merged = {**base, **profile}
+    merged["name"] = str(merged.get("name") or f"方案{idx + 1}").strip() or f"方案{idx + 1}"
+    merged["enabled"] = _bool_profile_value(merged.get("enabled"), True)
+    merged["chrome_profile"] = str(
+        merged.get("chrome_profile") or getattr(config, "browser_chrome_profile", "Default") or "Default"
+    ).strip() or "Default"
+    merged["flow"] = str(merged.get("flow") or "simple").strip() or "simple"
+    merged["upload_policy"] = str(merged.get("upload_policy") or "BTRA").strip() or "BTRA"
+    try:
+        merged["ad_interval"] = int(merged.get("ad_interval", 60))
+    except Exception:
+        merged["ad_interval"] = 60
+    try:
+        merged["ad_start"] = int(merged.get("ad_start", 0))
+    except Exception:
+        merged["ad_start"] = 0
+    merged["visibility"] = str(merged.get("visibility") or "PUBLIC").strip().upper() or "PUBLIC"
+    merged["title_template"] = str(merged.get("title_template") or "")
+    merged["description"] = str(merged.get("description") or "")
+    merged["cover_prompt"] = str(merged.get("cover_prompt") or "")
+    return merged
+
+
+def _load_upload_profiles(config) -> list[dict]:
     profiles_raw = getattr(config, "browser_profiles", "[]") or "[]"
     try:
         profiles = json.loads(profiles_raw)
@@ -180,22 +450,27 @@ def _get_active_profile(config) -> dict:
         profiles = []
 
     if not profiles:
-        # fallback 到旧字段（向后兼容）
-        return {
-            "flow": "full",
-            "upload_policy": getattr(config, "browser_upload_policy", "BTRA"),
-            "ad_interval": int(getattr(config, "browser_ad_interval", 60)),
-            "ad_start": int(getattr(config, "browser_ad_start", 0)),
-            "visibility": str(getattr(config, "browser_visibility", "PUBLIC")).strip().upper() or "PUBLIC",
-            "title_template": "",
-            "description": getattr(config, "youtube_description", ""),
-        }
+        return [_legacy_profile(config)]
+    return [_normalize_profile(config, p, idx) for idx, p in enumerate(profiles)]
 
+
+def _get_active_profile(config) -> dict:
+    """解析激活的上传方案，找不到时 fallback 到旧字段"""
+    profiles = _load_upload_profiles(config)
     active_name = getattr(config, "browser_active_profile", "") or ""
     for p in profiles:
         if p.get("name") == active_name:
             return p
     return profiles[0]
+
+
+def _get_upload_profiles(config) -> list[dict]:
+    """返回本次浏览器上传要执行的方案列表。默认只上传激活方案。"""
+    profiles = _load_upload_profiles(config)
+    if bool(getattr(config, "browser_upload_all_profiles", False)):
+        enabled = [p for p in profiles if p.get("enabled", True)]
+        return enabled or [_get_active_profile(config)]
+    return [_get_active_profile(config)]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -204,7 +479,9 @@ def _get_active_profile(config) -> dict:
 
 def upload_via_browser(job, config, video_path: Path, title: str,
                        cover_path: Optional[Path],
-                       on_log: Callable, on_progress: Callable) -> Optional[str]:
+                       on_log: Callable, on_progress: Callable,
+                       profile: Optional[dict] = None,
+                       force_profile_launch: bool = False) -> Optional[str]:
     """
     连接已打开的 Chrome（需带 --remote-debugging-port=9222），执行上传流程。
     根据激活方案的 flow 字段选择精简或完整流程。
@@ -216,13 +493,17 @@ def upload_via_browser(job, config, video_path: Path, title: str,
         on_log("❌ playwright 未安装，请运行: pip install playwright && playwright install chrome")
         return None
 
-    profile = _get_active_profile(config)
+    profile = _normalize_profile(config, profile, 0) if profile is not None else _get_active_profile(config)
     flow          = profile.get("flow", "simple")
     ad_interval   = int(profile.get("ad_interval", 60))
     ad_start      = int(profile.get("ad_start", 0))
     upload_policy = str(profile.get("upload_policy", "BTRA")).strip() or "BTRA"
     visibility    = str(profile.get("visibility", "PUBLIC")).strip().upper() or "PUBLIC"
     desc_override = profile.get("description", "")
+    chrome_profile = str(profile.get("chrome_profile") or getattr(config, "browser_chrome_profile", "Default") or "Default").strip()
+    ad_suitability_template = normalize_ad_suitability_template(
+        profile.get("ad_suitability_template") or getattr(config, "browser_ad_suitability_template", "")
+    )
 
     auto_restart      = getattr(config, "browser_auto_restart", True)
     stall_timeout_min = int(getattr(config, "browser_stall_timeout_min", 10))
@@ -230,7 +511,7 @@ def upload_via_browser(job, config, video_path: Path, title: str,
     delays            = _Delays(op_speed)
 
     profile_name = profile.get("name", "")
-    on_log(f"上传方案: 「{profile_name}」  流程: {'精简' if flow == 'simple' else '完整'}")
+    on_log(f"上传方案: 「{profile_name}」  账号资料: {chrome_profile}  流程: {'精简' if flow == 'simple' else '完整'}")
 
     _MAX_BROWSER_RESTARTS = 3
     for _browser_attempt in range(1, _MAX_BROWSER_RESTARTS + 1):
@@ -238,21 +519,30 @@ def upload_via_browser(job, config, video_path: Path, title: str,
             on_log("上传已取消")
             return None
 
+        if force_profile_launch and _browser_attempt == 1:
+            on_log(f"切换到账号资料「{chrome_profile}」...")
+            _kill_chrome(_chrome_debug_profile_dir(config, chrome_profile))
+            time.sleep(1)
+            if not _launch_chrome(config, on_log, chrome_profile):
+                on_log(f"❌ 无法启动账号资料「{chrome_profile}」")
+                return None
+
         # 检查调试端口是否可连
         if not _is_port_open(_DEBUG_PORT):
             if auto_restart and _browser_attempt == 1:
                 on_log(f"⚠️ 未检测到 Chrome 调试端口 {_DEBUG_PORT}，尝试自动启动...")
-                if not _launch_chrome(config, on_log):
-                    on_log("   请手动双击「Chrome调试模式启动.bat」，登录 YouTube Studio 后重试。")
+                if not _launch_chrome(config, on_log, chrome_profile):
+                    on_log("   macOS 可运行 scripts/start_chrome_debug_macos.command；Windows 可双击「Chrome调试模式启动.bat」。")
+                    on_log("   登录 YouTube Studio 后重试。")
                     return None
             elif auto_restart and _browser_attempt > 1:
                 on_log(f"⚠️ Chrome 端口消失（第 {_browser_attempt} 次），重启...")
-                if not _restart_chrome(config, on_log):
+                if not _restart_chrome(config, on_log, chrome_profile):
                     on_log("❌ 无法重启 Chrome，放弃")
                     return None
             else:
                 on_log(f"❌ 未检测到 Chrome 调试端口 {_DEBUG_PORT}")
-                on_log("   请用调试模式启动 Chrome（双击软件目录中的「Chrome调试模式启动.bat」），")
+                on_log("   请用调试模式启动 Chrome（macOS 运行 scripts/start_chrome_debug_macos.command；Windows 双击「Chrome调试模式启动.bat」），")
                 on_log("   打开 YouTube Studio 并登录后，再点击上传。")
                 return None
 
@@ -266,7 +556,7 @@ def upload_via_browser(job, config, video_path: Path, title: str,
         result = _run_upload_session(
             job, config, video_path, title, cover_path,
             flow, ad_interval, ad_start, upload_policy, visibility,
-            desc_override, delays, stall_timeout_min,
+            desc_override, delays, stall_timeout_min, ad_suitability_template,
             on_log, on_progress,
         )
 
@@ -277,7 +567,7 @@ def upload_via_browser(job, config, video_path: Path, title: str,
         if result == _STALL:
             on_log(f"⚠️ 上传卡住超过 {stall_timeout_min} 分钟（第 {_browser_attempt} 次），重启 Chrome...")
             if auto_restart:
-                if not _restart_chrome(config, on_log):
+                if not _restart_chrome(config, on_log, chrome_profile):
                     on_log("❌ 无法重启 Chrome，放弃")
                     return None
                 on_log("  等待 YouTube Studio 加载完成...")
@@ -289,7 +579,7 @@ def upload_via_browser(job, config, video_path: Path, title: str,
         elif result == "CHROME_CRASH":
             on_log(f"⚠️ Chrome 连接断开（第 {_browser_attempt} 次），重启...")
             if auto_restart:
-                if not _restart_chrome(config, on_log):
+                if not _restart_chrome(config, on_log, chrome_profile):
                     on_log("❌ 无法重启 Chrome，放弃")
                     return None
                 time.sleep(10)
@@ -311,7 +601,7 @@ def upload_via_browser(job, config, video_path: Path, title: str,
 
 def _run_upload_session(job, config, video_path, title, cover_path,
                         flow, ad_interval, ad_start, upload_policy, visibility,
-                        desc_override, delays, stall_timeout_min,
+                        desc_override, delays, stall_timeout_min, ad_suitability_template,
                         on_log, on_progress):
     """
     单次 Playwright 会话：连接 Chrome，尝试上传，返回 video_id / None / _STALL / 'CHROME_CRASH'
@@ -339,6 +629,7 @@ def _run_upload_session(job, config, video_path, title, cover_path,
                     break
             if page is None:
                 page = ctx.new_page()
+            _reset_youtube_studio_runtime_cache(ctx, page, on_log)
 
             _MAX_UPLOAD_RETRY = 3
             for _attempt in range(1, _MAX_UPLOAD_RETRY + 1):
@@ -357,9 +648,6 @@ def _run_upload_session(job, config, video_path, title, cover_path,
                             page.goto("https://studio.youtube.com", timeout=60_000)
                         page.wait_for_load_state("domcontentloaded", timeout=30_000)
                     except Exception as nav_e:
-                        if _is_browser_disconnect_error(nav_e):
-                            on_log(f"  ⚠️ Chrome 连接已断开，准备重启后重试: {str(nav_e)[:80]}")
-                            return "CHROME_CRASH"
                         on_log(f"  导航失败: {nav_e}，继续尝试...")
 
                 ban_check = getattr(job, "mode", "full") == "ban_check"
@@ -369,10 +657,21 @@ def _run_upload_session(job, config, video_path, title, cover_path,
                         ad_interval, ad_start, upload_policy, visibility, on_log, on_progress,
                         ban_check=ban_check, flow=flow, desc_override=desc_override,
                         delays=delays, stall_timeout_min=stall_timeout_min,
+                        ad_suitability_template=ad_suitability_template,
                     )
+                except _UploadPolicyConfirmError as e:
+                    on_log(f"  ⚠️ {e}，刷新浏览器后重新走上传流程...")
+                    try:
+                        page.reload(timeout=60_000, wait_until="domcontentloaded")
+                        page.wait_for_timeout(3_000)
+                    except Exception as refresh_e:
+                        on_log(f"  刷新失败: {refresh_e}，下一轮将重新导航 Studio 首页")
+                    video_id = None
                 except Exception as e:
                     err = str(e)
-                    if _is_browser_disconnect_error(err):
+                    if "Target page, context or browser has been closed" in err or \
+                       "Connection closed" in err or "WebSocket" in err or \
+                       "TargetClosedError" in err:
                         on_log(f"  ⚠️ Chrome 连接断开: {err[:80]}")
                         return "CHROME_CRASH"
                     on_log(f"  上传异常: {e}")
@@ -411,7 +710,8 @@ def _do_upload(page, job, config, video_path: Path, title: str,
                flow: str = "simple",
                desc_override: str = "",
                delays: "_Delays" = None,
-               stall_timeout_min: int = 10) -> Optional[str]:
+               stall_timeout_min: int = 10,
+               ad_suitability_template: dict | None = None) -> Optional[str]:
     from playwright.sync_api import TimeoutError as PWTimeout
 
     if delays is None:
@@ -423,6 +723,15 @@ def _do_upload(page, job, config, video_path: Path, title: str,
 
     # 描述：优先用方案覆盖值，否则用 config 默认
     desc = desc_override if desc_override else getattr(config, "youtube_description", "")
+    upload_state = {
+        "complete": False,
+        "last_pct": -1,
+        "last_activity": time.time(),
+        "app_pct": 22,
+    }
+
+    def step_progress(pct: int):
+        _emit_upload_progress(upload_state, pct, on_progress)
 
     # ── 步骤1：确认 Studio 已就绪 ─────────────────────────
     on_log("打开 YouTube Studio...")
@@ -481,7 +790,7 @@ def _do_upload(page, job, config, video_path: Path, title: str,
             on_log("❌ 未找到上传视频菜单项")
             return None
     page.wait_for_timeout(delays.step_between)
-    on_progress(25)
+    step_progress(25)
 
     # ── 步骤3：选择文件 ────────────────────────────────────
     if job.is_cancelled():
@@ -491,7 +800,7 @@ def _do_upload(page, job, config, video_path: Path, title: str,
     if not _select_file_via_dialog(page, video_path, on_log, TIMEOUT):
         on_log("❌ 文件对话框未识别，触发整体重试...")
         return None
-    on_progress(28)
+    step_progress(28)
 
     # ── 步骤4：填写标题 ────────────────────────────────────
     if job.is_cancelled():
@@ -528,7 +837,7 @@ def _do_upload(page, job, config, video_path: Path, title: str,
             except PWTimeout:
                 pass
 
-    on_progress(32)
+    step_progress(32)
 
     # ── 步骤5：上传封面 ────────────────────────────────────
     if job.is_cancelled():
@@ -538,7 +847,7 @@ def _do_upload(page, job, config, video_path: Path, title: str,
         on_log("上传封面...")
         _upload_cover(page, cover_path, on_log)
 
-    on_progress(35)
+    step_progress(35)
 
     # ── 步骤6-10：根据 flow 和 ban_check 决定中间步骤 ─────
     if job.is_cancelled():
@@ -546,24 +855,24 @@ def _do_upload(page, job, config, video_path: Path, title: str,
         return None
     if ban_check:
         on_log("[查禁播] 跳过标题/封面/版权/广告/分级，直接跳到公开范围...")
-        on_progress(50)
+        step_progress(50)
         _next_clicks = 5
     elif flow == "simple":
         on_log("精简流程：跳过创收/广告位/分级，直接跳到公开范围...")
-        on_progress(50)
+        step_progress(50)
         _next_clicks = 5
     else:
         on_log("继续 → 权利管理...")
         _click_next(page, TIMEOUT)
         page.wait_for_timeout(delays.step_between)
-        on_progress(38)
+        step_progress(38)
 
         if job.is_cancelled():
             on_log("上传已取消")
             return None
         on_log(f"设置上传政策（{upload_policy}）...")
         _set_upload_policy(page, upload_policy, on_log, TIMEOUT)
-        on_progress(45)
+        step_progress(45)
 
         if job.is_cancelled():
             on_log("上传已取消")
@@ -571,14 +880,14 @@ def _do_upload(page, job, config, video_path: Path, title: str,
         on_log("继续 → 创收页...")
         _click_next(page, TIMEOUT)
         page.wait_for_timeout(delays.step_between + 200)
-        on_progress(50)
+        step_progress(50)
 
         if job.is_cancelled():
             on_log("上传已取消")
             return None
         on_log("插入中贴片广告位...")
         _insert_ad_breaks(page, ad_interval, ad_start, on_log, TIMEOUT, job=job)
-        on_progress(60)
+        step_progress(60)
 
         if job.is_cancelled():
             on_log("上传已取消")
@@ -586,7 +895,7 @@ def _do_upload(page, job, config, video_path: Path, title: str,
         on_log("提交广告适合性分级...")
         on_log(f"  当前 URL: {page.url}")
         page.wait_for_timeout(delays.step_between + 500)
-        _submit_ad_suitability(page, on_log, TIMEOUT)
+        _submit_ad_suitability(page, on_log, TIMEOUT, ad_suitability_template)
         page.wait_for_timeout(delays.click_after)
         _next_clicks = 3
 
@@ -596,13 +905,21 @@ def _do_upload(page, job, config, video_path: Path, title: str,
         return None
     on_log("继续 → 公开范围...")
     for _ in range(_next_clicks):
+        if _is_upload_visibility_page(page):
+            break
         try:
-            _click_next(page, TIMEOUT)
+            _click_next(page, 8_000)
             page.wait_for_timeout(delays.click_after)
+            if _is_upload_visibility_page(page):
+                break
         except Exception:
             break
 
-    on_progress(70)
+    step_progress(70)
+
+    # 公开范围页已经出现时先选好目标范围，不等上传 100%。
+    # YouTube 允许先选范围，等左下角上传/检查就绪后再点发布或保存。
+    _select_upload_visibility(page, visibility, on_log)
 
     # ── 步骤12：等待上传完成并发布 ────────────────────────
     if job.is_cancelled():
@@ -612,6 +929,7 @@ def _do_upload(page, job, config, video_path: Path, title: str,
     video_id = _wait_for_upload_and_publish(
         page, job, visibility, on_log, on_progress, UPLOAD_TIMEOUT,
         stall_timeout_min=stall_timeout_min,
+        upload_state=upload_state,
     )
 
     if video_id is None:
@@ -621,8 +939,9 @@ def _do_upload(page, job, config, video_path: Path, title: str,
     if video_id == _STALL:
         return _STALL
 
-    on_log(f"✓ 视频已发布，video_id: {video_id}")
-    on_progress(100)
+    done_label = "发布" if visibility == "PUBLIC" else "保存"
+    on_log(f"✓ 视频已{done_label}，video_id: {video_id}")
+    step_progress(100)
 
     return video_id
 
@@ -667,25 +986,656 @@ def _set_upload_policy(page, policy_name: str, on_log: Callable, timeout: int):
         on_log("  ⚠️ 未找到权利管理页，跳过政策设置")
         return
 
-    # 点开"上传政策"下拉（专属 trigger id: policy-select-trigger）
-    try:
-        page.click('ytcp-text-dropdown-trigger#policy-select-trigger', timeout=10_000)
-        page.wait_for_timeout(800)
-    except PWTimeout:
-        on_log("  ⚠️ 无法点击上传政策下拉")
-        return
+    last_state = ""
+    for attempt in range(2):
+        try:
+            # 点开"上传政策"下拉（专属 trigger id: policy-select-trigger）
+            _click_upload_policy_dropdown(page, timeout=10_000)
+            page.wait_for_timeout(800)
 
-    # 等待选项列表渲染，选项是 tp-yt-paper-item
+            # 等待选项列表渲染。调试 Chrome 的旧缓存有时会让 Studio 先画出空白面板。
+            page.wait_for_function("""policyName => {
+                const wanted = String(policyName || '').trim().toLowerCase();
+                function visible(el) {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                }
+                function textOf(el) {
+                    return (el && el.textContent || '').trim().replace(/\s+/g, ' ');
+                }
+                function policyRootFor(el) {
+                    let node = el;
+                    while (node && node !== document.body) {
+                        const tag = (node.tagName || '').toLowerCase();
+                        const id = node.id || '';
+                        const cls = String(node.className || '');
+                        const text = textOf(node);
+                        if (
+                            tag === 'ytcms-policy-select-menu' ||
+                            id === 'policy-content-container' ||
+                            cls.includes('policy-list') ||
+                            (tag === 'ytcp-list' && text.includes('BTRA') && text.includes('Track in all countries'))
+                        ) {
+                            return node;
+                        }
+                        node = node.parentElement;
+                    }
+                    return null;
+                }
+                return Array.from(document.querySelectorAll('tp-yt-paper-item, [role="option"]'))
+                    .some(el => textOf(el).toLowerCase() === wanted && visible(el) && policyRootFor(el));
+            }""", arg=policy_name, timeout=20_000)
+            _click_upload_policy_option(page, policy_name, timeout=8_000)
+            page.wait_for_timeout(400)
+            # 点击"应用"按钮确认
+            _click_apply_upload_policy(page, timeout=5_000)
+            page.wait_for_timeout(700)
+
+            if _wait_for_upload_policy_selection(page, policy_name, timeout=6_000):
+                suffix = "" if attempt == 0 else "（重试后确认）"
+                on_log(f"  ✓ 已选择上传政策: {policy_name}{suffix}")
+                return
+
+            last_state = _current_upload_policy_text(page) or _describe_upload_policy_state(page)
+            if attempt == 0:
+                on_log(f"  ⚠️ 上传政策未确认到「{policy_name}」（当前: {last_state or '未知'}），重新选择一次...")
+                continue
+        except PWTimeout:
+            if _upload_policy_panel_looks_empty(page):
+                msg = "上传政策列表为空：调试 Chrome 的 YouTube Studio 前端缓存可能异常，请关闭调试 Chrome 后重试"
+                on_log(f"  ❌ {msg}")
+                raise _UploadPolicyConfirmError(msg)
+            last_state = _describe_upload_policy_state(page)
+            if attempt == 0:
+                on_log(f"  ⚠️ 上传政策选择未完成（当前列表: {last_state or '未知'}），重新选择一次...")
+                continue
+            if last_state:
+                msg = f"未找到政策「{policy_name}」，当前列表: {last_state}"
+            else:
+                msg = f"未找到政策「{policy_name}」"
+            on_log(f"  ❌ {msg}，停止进入创收页")
+            raise _UploadPolicyConfirmError(msg)
+
+    last_state = last_state or _current_upload_policy_text(page) or "未知"
+    msg = f"上传政策未确认到「{policy_name}」，当前为「{last_state}」，停止进入创收页"
+    on_log(f"  ❌ {msg}")
+    raise _UploadPolicyConfirmError(msg)
+
+
+def _current_upload_policy_text(page) -> str:
     try:
-        page.wait_for_selector('#policy-content-container tp-yt-paper-item', timeout=5_000)
-        page.click(f'#policy-content-container tp-yt-paper-item:has-text("{policy_name}")', timeout=8_000)
-        page.wait_for_timeout(400)
-        # 点击"应用"按钮确认
-        page.click('ytcp-button#apply-policy', timeout=5_000)
-        page.wait_for_timeout(500)
-        on_log(f"  ✓ 已选择上传政策: {policy_name}")
+        value = page.evaluate("""() => {
+            const norm = s => (s || '').trim().replace(/\s+/g, ' ');
+            const roots = [
+                document.querySelector('ytcms-policy-select'),
+                document.querySelector('ytcp-text-dropdown-trigger#policy-select-trigger'),
+                document.querySelector('#policy-select-trigger'),
+            ].filter(Boolean);
+            for (const root of roots) {
+                const direct = root.querySelector('.dropdown-trigger-text, span.dropdown-trigger-text');
+                const text = norm(direct && direct.textContent);
+                if (text) return text;
+                const fallback = norm(root.textContent);
+                if (fallback) return fallback;
+            }
+            const candidates = Array.from(document.querySelectorAll('ytcp-text-dropdown-trigger, ytcp-dropdown-trigger'));
+            for (const trigger of candidates) {
+                const text = norm(trigger.querySelector('.dropdown-trigger-text')?.textContent || trigger.textContent);
+                if (
+                    text === 'Track in all countries' ||
+                    text.includes('BTRA') ||
+                    text.includes('Monetize in all countries') ||
+                    text.includes('Block in all countries')
+                ) {
+                    return text;
+                }
+            }
+            return '';
+        }""")
+        return str(value or "").strip()
+    except Exception:
+        return ""
+
+
+def _wait_for_upload_policy_selection(page, policy_name: str, timeout: int = 6_000) -> bool:
+    try:
+        page.wait_for_function("""policyName => {
+            const wanted = String(policyName || '').trim().toLowerCase();
+            const norm = s => (s || '').trim().replace(/\s+/g, ' ');
+            const matches = text => {
+                const value = norm(text).toLowerCase();
+                return value === wanted || value.includes(wanted);
+            };
+            const roots = [
+                document.querySelector('ytcms-policy-select'),
+                document.querySelector('ytcp-text-dropdown-trigger#policy-select-trigger'),
+                document.querySelector('#policy-select-trigger'),
+            ].filter(Boolean);
+            for (const root of roots) {
+                const direct = root.querySelector('.dropdown-trigger-text, span.dropdown-trigger-text');
+                if (matches(direct && direct.textContent)) return true;
+                if (matches(root.textContent)) return true;
+            }
+            return Array.from(document.querySelectorAll('ytcp-text-dropdown-trigger, ytcp-dropdown-trigger'))
+                .some(trigger => matches(trigger.querySelector('.dropdown-trigger-text')?.textContent || trigger.textContent));
+        }""", arg=policy_name, timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _upload_policy_panel_looks_empty(page) -> bool:
+    try:
+        return bool(page.evaluate("""() => {
+            const panel = document.querySelector('#policy-content-container, ytcp-list, tp-yt-paper-listbox');
+            if (!panel) return false;
+            const items = Array.from(document.querySelectorAll(
+                '#policy-content-container tp-yt-paper-item, #items tp-yt-paper-item, ytcp-list tp-yt-paper-item, tp-yt-paper-item[role="option"], tp-yt-paper-item'
+            )).filter(el => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            });
+            return items.length === 0;
+        }"""))
+    except Exception:
+        return False
+
+
+def _describe_upload_policy_state(page) -> str:
+    try:
+        state = page.evaluate("""() => {
+            const norm = s => (s || '').trim().replace(/\s+/g, ' ');
+            function textOf(el) { return norm(el && el.textContent || ''); }
+            function policyRootFor(el) {
+                let node = el;
+                while (node && node !== document.body) {
+                    const tag = (node.tagName || '').toLowerCase();
+                    const id = node.id || '';
+                    const cls = String(node.className || '');
+                    const text = textOf(node);
+                    if (
+                        tag === 'ytcms-policy-select-menu' ||
+                        id === 'policy-content-container' ||
+                        cls.includes('policy-list') ||
+                        (tag === 'ytcp-list' && text.includes('BTRA') && text.includes('Track in all countries'))
+                    ) {
+                        return node;
+                    }
+                    node = node.parentElement;
+                }
+                return null;
+            }
+            const btra = Array.from(document.querySelectorAll('tp-yt-paper-item, [role="option"]'))
+                .find(el => textOf(el) === 'BTRA' && policyRootFor(el));
+            const root = btra && policyRootFor(btra);
+            const rowSource = root ? root.querySelectorAll('tp-yt-paper-item, [role="option"]') : [];
+            const rows = Array.from(rowSource).map(el => ({
+                id: el.id || '',
+                text: norm(el.textContent),
+                selected: el.hasAttribute('selected'),
+                ariaDisabled: el.getAttribute('aria-disabled')
+            })).filter(row => row.text);
+            const current = norm(document.querySelector('ytcms-policy-select')?.textContent || '');
+            return {current, rows};
+        }""")
+        if not isinstance(state, dict):
+            return ""
+        current = str(state.get("current") or "").strip()
+        rows = state.get("rows") or []
+        parts = []
+        for row in rows[:8]:
+            if not isinstance(row, dict):
+                continue
+            item = f"{row.get('id') or '?'}={row.get('text') or ''}"
+            if row.get("selected"):
+                item += "[selected]"
+            parts.append(item)
+        summary = "; ".join(parts)
+        if current:
+            return f"current={current}; {summary}"
+        return summary
+    except Exception:
+        return ""
+
+
+def _click_upload_policy_dropdown(page, timeout: int = 10_000):
+    """Open the upload-policy dropdown across YouTube Studio DOM variants."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    selectors = [
+        'ytcms-policy-select ytcp-dropdown-trigger[role="button"]',
+        'ytcms-policy-select ytcp-text-dropdown-trigger',
+        'ytcms-policy-select',
+        'ytcp-text-dropdown-trigger#policy-select-trigger',
+    ]
+    last_exc = None
+    selector_timeout = min(timeout, 3_000)
+    for selector in selectors:
+        try:
+            page.click(selector, timeout=selector_timeout)
+            return
+        except PWTimeout as exc:
+            last_exc = exc
+
+    try:
+        clicked = page.evaluate("""() => {
+            function visible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }
+            function fireClick(el) {
+                el.scrollIntoView({block: 'center', inline: 'center'});
+                for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    el.dispatchEvent(new MouseEvent(type, {bubbles: true, composed: true, view: window}));
+                }
+            }
+            function innerButton(host) {
+                if (!host) return null;
+                const roots = [host, host.shadowRoot].filter(Boolean);
+                for (const root of roots) {
+                    const btn = root.querySelector('[role="button"], button, .container, .left-container, .dropdown-trigger-text');
+                    if (btn && visible(btn)) return btn;
+                }
+                return visible(host) ? host : null;
+            }
+
+            const exact = document.querySelector(
+                'ytcms-policy-select ytcp-dropdown-trigger, ' +
+                'ytcms-policy-select ytcp-text-dropdown-trigger, ' +
+                'ytcms-policy-select, ' +
+                'ytcp-text-dropdown-trigger#policy-select-trigger, ' +
+                '#policy-select-trigger'
+            );
+            const exactBtn = innerButton(exact);
+            if (exactBtn) {
+                fireClick(exactBtn);
+                return true;
+            }
+
+            const policyHints = ['上传政策', 'Upload policy', 'BTRA', 'Track in all countries', 'Monetize in all countries', 'Block in all countries'];
+            const triggers = Array.from(document.querySelectorAll('ytcms-policy-select, ytcp-text-dropdown-trigger, tp-yt-paper-dropdown-menu'));
+            for (const trigger of triggers) {
+                const text = (trigger.textContent || '').trim();
+                if (trigger.matches('ytcms-policy-select') || policyHints.some(hint => text.includes(hint))) {
+                    const btn = innerButton(trigger);
+                    if (btn) {
+                        fireClick(btn);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }""")
+        if clicked:
+            return
+        raise last_exc or PWTimeout("Upload policy dropdown not found")
     except PWTimeout:
-        on_log(f"  ⚠️ 未找到政策「{policy_name}」，请手动选择")
+        raise
+
+
+def _click_upload_policy_option(page, policy_name: str, timeout: int = 8_000):
+    """Select the named upload policy from either the old or current policy list."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    def selection_matches() -> bool:
+        try:
+            return bool(page.evaluate("""policyName => {
+                const wanted = String(policyName || '').trim().toLowerCase();
+                const norm = s => (s || '').trim().replace(/\s+/g, ' ').toLowerCase();
+                function textOf(el) { return (el && el.textContent || '').trim().replace(/\s+/g, ' '); }
+                function policyRootFor(el) {
+                    let node = el;
+                    while (node && node !== document.body) {
+                        const tag = (node.tagName || '').toLowerCase();
+                        const id = node.id || '';
+                        const cls = String(node.className || '');
+                        const text = textOf(node);
+                        if (
+                            tag === 'ytcms-policy-select-menu' ||
+                            id === 'policy-content-container' ||
+                            cls.includes('policy-list') ||
+                            (tag === 'ytcp-list' && text.includes('BTRA') && text.includes('Track in all countries'))
+                        ) {
+                            return node;
+                        }
+                        node = node.parentElement;
+                    }
+                    return null;
+                }
+                const btra = Array.from(document.querySelectorAll('tp-yt-paper-item, [role="option"]'))
+                    .find(el => textOf(el).toLowerCase() === wanted && policyRootFor(el));
+                const root = btra && policyRootFor(btra);
+                const selected = root && Array.from(root.querySelectorAll('tp-yt-paper-item[selected], [role="option"][selected]'))
+                    .find(el => norm(el.textContent) === wanted || norm(el.textContent).includes(wanted));
+                if (selected) return true;
+                const current = norm(document.querySelector('ytcms-policy-select')?.textContent || '');
+                return current === wanted || current.includes(wanted);
+            }""", policy_name))
+        except Exception:
+            return False
+
+    try:
+        selected = page.evaluate("""policyName => {
+            const wanted = String(policyName || '').trim().toLowerCase();
+            function visible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }
+            function textOf(el) {
+                return (el && el.textContent || '').trim().replace(/\s+/g, ' ');
+            }
+            function policyRootFor(el) {
+                let node = el;
+                while (node && node !== document.body) {
+                    const tag = (node.tagName || '').toLowerCase();
+                    const id = node.id || '';
+                    const cls = String(node.className || '');
+                    const text = textOf(node);
+                    if (
+                        tag === 'ytcms-policy-select-menu' ||
+                        id === 'policy-content-container' ||
+                        cls.includes('policy-list') ||
+                        (tag === 'ytcp-list' && text.includes('BTRA') && text.includes('Track in all countries'))
+                    ) {
+                        return node;
+                    }
+                    node = node.parentElement;
+                }
+                return null;
+            }
+            function selectedText() {
+                const btra = Array.from(document.querySelectorAll('tp-yt-paper-item, [role="option"]'))
+                    .find(el => textOf(el).toLowerCase() === wanted && visible(el) && policyRootFor(el));
+                const root = btra && policyRootFor(btra);
+                const selected = root && Array.from(root.querySelectorAll('tp-yt-paper-item[selected], [role="option"][selected]')).find(visible);
+                return textOf(selected);
+            }
+            function fireClick(el) {
+                el.scrollIntoView({block: 'center', inline: 'center'});
+                el.focus && el.focus();
+                const rect = el.getBoundingClientRect();
+                const x = rect.left + rect.width / 2;
+                const y = rect.top + rect.height / 2;
+                if (window.PointerEvent) {
+                    for (const type of ['pointerover', 'pointermove', 'pointerdown', 'pointerup']) {
+                        el.dispatchEvent(new PointerEvent(type, {
+                            bubbles: true, composed: true, view: window,
+                            clientX: x, clientY: y, pointerId: 1, pointerType: 'mouse', isPrimary: true
+                        }));
+                    }
+                }
+                for (const type of ['mouseover', 'mousemove', 'mousedown', 'mouseup', 'click']) {
+                    el.dispatchEvent(new MouseEvent(type, {bubbles: true, composed: true, view: window, clientX: x, clientY: y}));
+                }
+                el.click && el.click();
+                el.dispatchEvent(new CustomEvent('tap', {bubbles: true, composed: true}));
+            }
+            const btra = Array.from(document.querySelectorAll('tp-yt-paper-item, [role="option"]'))
+                .find(el => textOf(el).toLowerCase() === wanted && visible(el) && policyRootFor(el));
+            const root = btra && policyRootFor(btra);
+            const itemSource = root ? root.querySelectorAll('tp-yt-paper-item, [role="option"]') : [];
+            const items = Array.from(itemSource).filter(visible).map((el, index) => {
+                const text = textOf(el);
+                const rect = el.getBoundingClientRect();
+                return {
+                    el,
+                    id: el.id || '',
+                    text,
+                    exact: text.toLowerCase() === wanted,
+                    contains: text.toLowerCase().includes(wanted),
+                    index,
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2
+                };
+            }).filter(item => item.exact || item.contains);
+            items.sort((a, b) => Number(b.exact) - Number(a.exact));
+            const target = items[0];
+            if (!target) return {selected: selectedText(), found: false};
+            fireClick(target.el);
+            return {
+                found: true,
+                selected: selectedText(),
+                id: target.id,
+                targetText: target.text,
+                x: target.x,
+                y: target.y
+            };
+        }""", policy_name)
+        if isinstance(selected, dict) and str(selected.get("selected", "")).strip().lower() == policy_name.strip().lower():
+            return
+        if isinstance(selected, dict) and selected.get("id"):
+            escaped_id = str(selected["id"]).replace("\\", "\\\\").replace('"', '\\"')
+            direct_selectors = [
+                f'ytcms-policy-select-menu tp-yt-paper-item#{escaped_id}',
+                f'#policy-content-container tp-yt-paper-item#{escaped_id}',
+                f'ytcp-list tp-yt-paper-item#{escaped_id}',
+            ]
+            for selector in direct_selectors:
+                try:
+                    page.click(selector, timeout=1_000, force=True)
+                    page.wait_for_timeout(250)
+                    if selection_matches():
+                        return
+                except Exception:
+                    pass
+        if isinstance(selected, dict) and selected.get("x") is not None and selected.get("y") is not None:
+            x = float(selected["x"])
+            y = float(selected["y"])
+            page.mouse.move(x, y)
+            page.mouse.down()
+            page.wait_for_timeout(80)
+            page.mouse.up()
+            page.wait_for_timeout(250)
+            if selection_matches():
+                return
+        forced = page.evaluate("""policyName => {
+            const wanted = String(policyName || '').trim().toLowerCase();
+            function visible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+            }
+            function textOf(el) {
+                return (el && el.textContent || '').trim().replace(/\s+/g, ' ');
+            }
+            function policyRootFor(el) {
+                let node = el;
+                while (node && node !== document.body) {
+                    const tag = (node.tagName || '').toLowerCase();
+                    const id = node.id || '';
+                    const cls = String(node.className || '');
+                    const text = textOf(node);
+                    if (
+                        tag === 'ytcms-policy-select-menu' ||
+                        id === 'policy-content-container' ||
+                        cls.includes('policy-list') ||
+                        (tag === 'ytcp-list' && text.includes('BTRA') && text.includes('Track in all countries'))
+                    ) {
+                        return node;
+                    }
+                    node = node.parentElement;
+                }
+                return null;
+            }
+            function fireClick(el) {
+                el.scrollIntoView({block: 'center', inline: 'center'});
+                el.focus && el.focus();
+                const rect = el.getBoundingClientRect();
+                const x = rect.left + rect.width / 2;
+                const y = rect.top + rect.height / 2;
+                if (window.PointerEvent) {
+                    for (const type of ['pointerover', 'pointermove', 'pointerdown', 'pointerup']) {
+                        el.dispatchEvent(new PointerEvent(type, {
+                            bubbles: true, composed: true, view: window,
+                            clientX: x, clientY: y, pointerId: 1, pointerType: 'mouse', isPrimary: true
+                        }));
+                    }
+                }
+                for (const type of ['mouseover', 'mousemove', 'mousedown', 'mouseup', 'click']) {
+                    el.dispatchEvent(new MouseEvent(type, {bubbles: true, composed: true, view: window, clientX: x, clientY: y}));
+                }
+                el.click && el.click();
+                el.dispatchEvent(new CustomEvent('tap', {bubbles: true, composed: true}));
+                el.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', bubbles: true, composed: true}));
+                el.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', code: 'Enter', bubbles: true, composed: true}));
+            }
+            const btra = Array.from(document.querySelectorAll('tp-yt-paper-item, [role="option"]'))
+                .find(el => textOf(el).toLowerCase() === wanted && visible(el) && policyRootFor(el));
+            const root = btra && policyRootFor(btra);
+            const item = root && Array.from(root.querySelectorAll('tp-yt-paper-item, [role="option"]')).filter(visible).find(el => textOf(el).toLowerCase() === wanted);
+            if (!item) return false;
+            fireClick(item);
+            const selected = Array.from(root.querySelectorAll('tp-yt-paper-item[selected], [role="option"][selected]')).filter(visible).find(el => textOf(el).toLowerCase() === wanted);
+            return !!selected;
+        }""", policy_name)
+        if forced or selection_matches():
+            return
+    except Exception:
+        pass
+
+    escaped = policy_name.replace('"', '\\"')
+    selectors = [
+        f'ytcms-policy-select-menu tp-yt-paper-item:has-text("{escaped}")',
+        f'ytcms-policy-select-menu [role="option"]:has-text("{escaped}")',
+        f'#policy-content-container tp-yt-paper-item:has-text("{escaped}")',
+        f'ytcp-list tp-yt-paper-item:has-text("{escaped}")',
+    ]
+    last_exc = None
+    selector_timeout = min(timeout, 3_000)
+    for selector in selectors:
+        try:
+            page.click(selector, timeout=selector_timeout)
+            return
+        except PWTimeout as exc:
+            last_exc = exc
+    try:
+        clicked = page.evaluate("""policyName => {
+            const wanted = String(policyName || '').trim().toLowerCase();
+            function visible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }
+            function fireClick(el) {
+                el.scrollIntoView({block: 'center', inline: 'center'});
+                el.focus && el.focus();
+                const rect = el.getBoundingClientRect();
+                const x = rect.left + rect.width / 2;
+                const y = rect.top + rect.height / 2;
+                if (window.PointerEvent) {
+                    for (const type of ['pointerover', 'pointermove', 'pointerdown', 'pointerup']) {
+                        el.dispatchEvent(new PointerEvent(type, {
+                            bubbles: true, composed: true, view: window,
+                            clientX: x, clientY: y, pointerId: 1, pointerType: 'mouse', isPrimary: true
+                        }));
+                    }
+                }
+                for (const type of ['mouseover', 'mousemove', 'mousedown', 'mouseup', 'click']) {
+                    el.dispatchEvent(new MouseEvent(type, {bubbles: true, composed: true, view: window, clientX: x, clientY: y}));
+                }
+                el.click && el.click();
+                el.dispatchEvent(new CustomEvent('tap', {bubbles: true, composed: true}));
+            }
+            function textOf(el) {
+                return (el && el.textContent || '').trim().replace(/\s+/g, ' ');
+            }
+            function policyRootFor(el) {
+                let node = el;
+                while (node && node !== document.body) {
+                    const tag = (node.tagName || '').toLowerCase();
+                    const id = node.id || '';
+                    const cls = String(node.className || '');
+                    const text = textOf(node);
+                    if (
+                        tag === 'ytcms-policy-select-menu' ||
+                        id === 'policy-content-container' ||
+                        cls.includes('policy-list') ||
+                        (tag === 'ytcp-list' && text.includes('BTRA') && text.includes('Track in all countries'))
+                    ) {
+                        return node;
+                    }
+                    node = node.parentElement;
+                }
+                return null;
+            }
+            const btra = Array.from(document.querySelectorAll('tp-yt-paper-item, [role="option"]'))
+                .find(el => textOf(el).toLowerCase() === wanted && visible(el) && policyRootFor(el));
+            const root = btra && policyRootFor(btra);
+            const items = root ? Array.from(root.querySelectorAll('tp-yt-paper-item, [role="option"]')).filter(visible) : [];
+            for (const item of items) {
+                const text = textOf(item);
+                if (text.toLowerCase() === wanted || text.toLowerCase().includes(wanted)) {
+                    fireClick(item);
+                    return true;
+                }
+            }
+            return false;
+        }""", policy_name)
+        if clicked:
+            return
+        raise last_exc or PWTimeout(f"Policy option not found: {policy_name}")
+    except PWTimeout:
+        raise
+
+
+def _click_apply_upload_policy(page, timeout: int = 5_000):
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    try:
+        page.click('ytcms-policy-select-menu ytcp-button#apply-policy', timeout=timeout)
+        return
+    except PWTimeout:
+        pass
+
+    try:
+        page.click('ytcp-button#apply-policy', timeout=timeout)
+        return
+    except PWTimeout:
+        clicked = page.evaluate("""() => {
+            function visible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }
+            function fireClick(el) {
+                el.scrollIntoView({block: 'center', inline: 'center'});
+                for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    el.dispatchEvent(new MouseEvent(type, {bubbles: true, composed: true, view: window}));
+                }
+            }
+            const candidates = Array.from(document.querySelectorAll('ytcp-button#apply-policy, ytcp-button'));
+            for (const btn of candidates) {
+                const text = (btn.textContent || '').trim();
+                if (btn.id === 'apply-policy' || text === '应用' || text === 'Apply') {
+                    const inner = (btn.shadowRoot && (btn.shadowRoot.querySelector('button') || btn.shadowRoot.querySelector('[role="button"]'))) ||
+                        btn.querySelector('button, [role="button"]') ||
+                        btn;
+                    if (visible(inner)) {
+                        fireClick(inner);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }""")
+        if clicked:
+            return
+        raise
 
 
 # ─────────────────────────────────────────────────────────────
@@ -882,12 +1832,12 @@ def _insert_ad_breaks(page, interval: int, start: int, on_log: Callable, timeout
         on_log("  ⚠️ 未找到创收页继续按钮，请手动点击")
 
 
-def _submit_ad_suitability(page, on_log: Callable, timeout: int):
+def _submit_ad_suitability(page, on_log: Callable, timeout: int, template: dict | None = None):
     """
     是否适合投放广告页面：全程用 JS evaluate 操作（元素在深层 Shadow DOM 内）
     1. 轮询等待分级页面出现
-    2. 展开第一个问题（toggle-button 的内部 button）
-    3. 点第一个 radio
+    2. 按模板匹配问题分类，展开并点击指定 radio
+    3. 选项序号 0 表示保持默认/跳过
     4. 点 #submit-questionnaire-button 提交
     """
     JS_HELPERS = """
@@ -931,33 +1881,70 @@ def _submit_ad_suitability(page, on_log: Callable, timeout: int):
     #       > ytcp-expansion-panel #container > ytcp-ve > div#button-area > button  ← 展开按钮
     #       > ytcp-expansion-panel #container > div#content-area
     #         > tp-yt-paper-radio-group > tp-yt-paper-radio-button  ← radio 选项
-    result = page.evaluate("""() => {
-        const q0 = document.querySelector(
+    template = normalize_ad_suitability_template(template)
+    choices = page.evaluate(r"""async (template) => {
+        const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+        const visible = (el) => {
+            if (!el || !el.getBoundingClientRect) return false;
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+        };
+        const questions = Array.from(document.querySelectorAll(
             'ytpp-self-certification-questionnaire .questions ytpp-self-certification-question'
-        );
-        if (!q0) return 'no-question';
-        const btn = q0.querySelector('ytcp-expansion-panel #button-area button');
-        if (!btn) return 'no-btn';
-        btn.click();
-        return 'clicked:' + btn.textContent.trim().slice(0, 20);
-    }""")
-    on_log(f"  展开结果: {result}")
-    page.wait_for_timeout(1200)  # 等展开动画完成
-
-    # 点第一个 radio（tp-yt-paper-radio-button，直接在 light DOM）
-    clicked = page.evaluate("""() => {
-        const q0 = document.querySelector(
-            'ytpp-self-certification-questionnaire .questions ytpp-self-certification-question'
-        );
-        if (!q0) return 'no-question';
-        const rg = q0.querySelector('tp-yt-paper-radio-group');
-        if (!rg) return 'no-radio-group';
-        const radio = rg.querySelector('tp-yt-paper-radio-button');
-        if (!radio) return 'no-radio';
-        radio.click();
-        return 'clicked:' + (radio.id || radio.getAttribute('name') || '?');
-    }""")
-    on_log(f"  radio 点击结果: {clicked}")
+        ));
+        const results = [];
+        for (let i = 0; i < questions.length; i++) {
+            const q = questions[i];
+            const qText = normalize(q.innerText || q.textContent || '');
+            let choice = Number(template.default || 1);
+            let matched = 'default';
+            for (const [key, rawChoice] of Object.entries(template.questions || {})) {
+                if (key && qText.includes(key)) {
+                    choice = Number(rawChoice);
+                    matched = key;
+                    break;
+                }
+            }
+            if (!choice || choice < 1) {
+                results.push({index: i + 1, matched, choice, status: 'skipped', text: qText.slice(0, 36)});
+                continue;
+            }
+            let radios = Array.from(q.querySelectorAll('tp-yt-paper-radio-button'));
+            if (!radios.some(visible)) {
+                const btn = q.querySelector('ytcp-expansion-panel #button-area button');
+                if (btn) {
+                    btn.click();
+                    await sleep(700);
+                }
+                radios = Array.from(q.querySelectorAll('tp-yt-paper-radio-button'));
+            }
+            const visibleRadios = radios.filter(visible);
+            const usable = visibleRadios.length ? visibleRadios : radios;
+            const radio = usable[choice - 1];
+            if (!radio) {
+                results.push({index: i + 1, matched, choice, status: 'missing-radio', text: qText.slice(0, 36)});
+                continue;
+            }
+            radio.click();
+            await sleep(180);
+            results.push({
+                index: i + 1,
+                matched,
+                choice,
+                status: 'clicked',
+                text: qText.slice(0, 36),
+                radio: normalize(radio.innerText || radio.textContent || radio.getAttribute('name') || '').slice(0, 36)
+            });
+        }
+        return results;
+    }""", template)
+    selected_count = sum(1 for item in choices if item.get("status") == "clicked")
+    skipped_count = sum(1 for item in choices if item.get("status") == "skipped")
+    on_log(f"  广告分级模板已应用：选择 {selected_count} 项，跳过 {skipped_count} 项")
+    for item in choices[:12]:
+        on_log(f"    Q{item.get('index')} {item.get('matched')}={item.get('choice')} -> {item.get('status')}")
     page.wait_for_timeout(600)
 
     # 点提交按钮
@@ -982,19 +1969,459 @@ def _submit_ad_suitability(page, on_log: Callable, timeout: int):
 # 等待上传完成并发布
 # ─────────────────────────────────────────────────────────────
 
+def _read_upload_progress(page) -> Optional[dict]:
+    """Read the visible bottom-left YouTube progress label."""
+    try:
+        return page.evaluate("""() => {
+            function visible(el) {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+            }
+            function collectDeep(root, selector, out = []) {
+                if (!root || !root.querySelectorAll) return out;
+                for (const el of root.querySelectorAll(selector)) out.push(el);
+                for (const el of root.querySelectorAll('*')) {
+                    if (el.shadowRoot) collectDeep(el.shadowRoot, selector, out);
+                }
+                return out;
+            }
+            function collectText(root) {
+                let parts = [];
+                const text = root.innerText || root.textContent || '';
+                if (text) parts.push(text);
+                for (const el of root.querySelectorAll('*')) {
+                    const t = el.innerText || el.textContent || '';
+                    if (t) parts.push(t);
+                    if (el.shadowRoot) {
+                        const st = collectText(el.shadowRoot);
+                        if (st) parts.push(st);
+                    }
+                }
+                return parts.join('\\n');
+            }
+            const comp = document.querySelector('ytcp-video-upload-progress');
+            if (!comp) return null;
+            const roots = [comp, comp.shadowRoot].filter(Boolean);
+            const progressLabels = roots.flatMap(root => collectDeep(root, 'span.progress-label, .progress-label'))
+                .filter(visible)
+                .map(el => (el.innerText || el.textContent || '').trim())
+                .filter(Boolean);
+            const text = progressLabels.length ? progressLabels[progressLabels.length - 1] : roots.map(collectText).join('\\n');
+            const m = text.match(/(\\d+)\\s*%/);
+            const pct = m ? parseInt(m[1]) : null;
+            const lower = text.toLowerCase();
+            let phase = 'unknown';
+            if (text.includes('上传完毕') || lower.includes('upload complete') || lower.includes('upload finished')) {
+                phase = 'complete';
+            } else if (text.includes('检查') || text.includes('检测') || lower.includes('check')) {
+                phase = 'checking';
+            } else if (text.includes('处理') || lower.includes('processing')) {
+                phase = 'processing';
+            } else if (text.includes('上传') || lower.includes('upload')) {
+                phase = 'uploading';
+            }
+            return { pct, phase, text };
+        }""")
+    except Exception:
+        return None
+
+
+def _emit_upload_progress(state: dict, pct: int, on_progress: Callable) -> None:
+    """Emit app progress without ever moving the UI backwards."""
+    try:
+        pct = int(pct)
+        current = int(state.get("app_pct", 0))
+    except Exception:
+        return
+    if pct <= current:
+        return
+    state["app_pct"] = pct
+    on_progress(pct)
+
+
+def _click_precheck_publish_dialog(page) -> Optional[dict]:
+    """Click Publish in YouTube's still-checking dialog and report whether it closed."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    try:
+        exact_btn = page.locator('ytcp-prechecks-warning-dialog ytcp-button#secondary-action-button').first
+        if exact_btn.is_visible(timeout=800):
+            exact_btn.click(timeout=3_000, force=True)
+            page.wait_for_timeout(800)
+            try:
+                still_visible = page.locator('ytcp-prechecks-warning-dialog').first.is_visible(timeout=800)
+            except PWTimeout:
+                still_visible = False
+            if not still_visible:
+                return {
+                    "visible": False,
+                    "clicked": True,
+                    "dismissed": True,
+                    "method": "playwright-secondary-action",
+                    "buttonId": "secondary-action-button",
+                }
+    except Exception:
+        pass
+
+    try:
+        return page.evaluate("""async () => {
+            function allDeep(root, selector, out = []) {
+                if (!root) return out;
+                if (root.querySelectorAll) {
+                    for (const el of root.querySelectorAll(selector)) out.push(el);
+                    for (const el of root.querySelectorAll('*')) {
+                        if (el.shadowRoot) allDeep(el.shadowRoot, selector, out);
+                    }
+                }
+                return out;
+            }
+            function textOf(node) {
+                const parts = [];
+                function visit(n) {
+                    if (!n) return;
+                    if (n.nodeType === Node.TEXT_NODE) {
+                        const t = (n.textContent || '').trim();
+                        if (t) parts.push(t);
+                        return;
+                    }
+                    if (
+                        n.nodeType !== Node.ELEMENT_NODE &&
+                        n.nodeType !== Node.DOCUMENT_FRAGMENT_NODE &&
+                        n.nodeType !== Node.DOCUMENT_NODE
+                    ) return;
+                    if (n.shadowRoot) visit(n.shadowRoot);
+                    for (const child of n.childNodes || []) visit(child);
+                }
+                visit(node);
+                return parts.join(' ').replace(/\\s+/g, ' ').trim();
+            }
+            function visible(el) {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+            }
+            function clickTarget(el) {
+                return (
+                    (el.shadowRoot && (el.shadowRoot.querySelector('button') || el.shadowRoot.querySelector('[role="button"]'))) ||
+                    el.querySelector('button, [role="button"]') ||
+                    el
+                );
+            }
+            function fireClick(el) {
+                if (!el) return false;
+                try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+                try { el.removeAttribute('disabled'); } catch (_) {}
+                try { el.removeAttribute('aria-disabled'); } catch (_) {}
+                try { if ('disabled' in el) el.disabled = false; } catch (_) {}
+                for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    try {
+                        el.dispatchEvent(new MouseEvent(type, {
+                            bubbles: true,
+                            cancelable: true,
+                            composed: true,
+                            view: window
+                        }));
+                    } catch (_) {}
+                }
+                try { el.click(); } catch (_) {}
+                return true;
+            }
+            function clickElementCenter(el) {
+                if (!el || !el.getBoundingClientRect) return false;
+                try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+                const r = el.getBoundingClientRect();
+                const x = Math.max(1, Math.min(window.innerWidth - 1, r.left + r.width / 2));
+                const y = Math.max(1, Math.min(window.innerHeight - 1, r.top + r.height / 2));
+                const top = document.elementFromPoint(x, y) || el;
+                fireClick(top);
+                return true;
+            }
+
+            const dialogs = allDeep(document, 'ytcp-prechecks-warning-dialog')
+                .filter(visible);
+            const dialog = dialogs.find(d => {
+                const t = textOf(d).toLowerCase();
+                return t.includes('仍在检查') ||
+                    t.includes('检查你的视频') ||
+                    t.includes('still checking') ||
+                    t.includes('checking your video') ||
+                    t.includes('checks are still');
+            });
+            if (!dialog) return { visible: false, clicked: false, reason: 'not_found' };
+
+            const dialogText = textOf(dialog);
+            const exactButton =
+                dialog.querySelector('ytcp-button#secondary-action-button') ||
+                dialog.querySelector('#secondary-action-button');
+            const allButtons = allDeep(dialog, 'ytcp-button, tp-yt-paper-button, button, [role="button"]')
+                .filter(visible)
+                .map(el => ({ el, text: textOf(el), id: el.id || el.getAttribute('id') || '' }));
+            const candidates = (exactButton ? [{ el: exactButton, text: textOf(exactButton), id: exactButton.id || exactButton.getAttribute('id') || 'secondary-action-button' }] : [])
+                .concat(allButtons)
+                .filter(item => {
+                    const t = (item.text || '').toLowerCase();
+                    const isPublish = item.text === '发布' || t === 'publish' || t.includes('发布') || t.includes('publish');
+                    const isChangeVisibility = t.includes('更改') || t.includes('change') || t.includes('visibility') || t.includes('公开范围');
+                    return isPublish && !isChangeVisibility;
+                })
+                .sort((a, b) => {
+                    const aSecondary = (a.id || '').includes('secondary-action') ? 0 : 1;
+                    const bSecondary = (b.id || '').includes('secondary-action') ? 0 : 1;
+                    if (aSecondary !== bSecondary) return aSecondary - bSecondary;
+                    return (a.text || '').length - (b.text || '').length;
+                });
+            if (!candidates.length) {
+                return {
+                    visible: true,
+                    clicked: false,
+                    dismissed: false,
+                    reason: 'button_not_found',
+                    text: dialogText.slice(0, 200),
+                    buttons: allButtons.map(item => ({ id: item.id, text: item.text })).slice(0, 8)
+                };
+            }
+
+            const target = clickTarget(candidates[0].el);
+            const disabled =
+                candidates[0].el.hasAttribute('disabled') ||
+                candidates[0].el.getAttribute('aria-disabled') === 'true' ||
+                target.disabled === true ||
+                target.getAttribute('aria-disabled') === 'true';
+            fireClick(candidates[0].el);
+            if (target !== candidates[0].el) fireClick(target);
+            clickElementCenter(target);
+            clickElementCenter(candidates[0].el);
+            await new Promise(resolve => setTimeout(resolve, 800));
+            const stillVisible = document.contains(dialog) && visible(dialog);
+            return {
+                visible: stillVisible,
+                clicked: true,
+                dismissed: !stillVisible,
+                disabledBefore: disabled,
+                buttonText: candidates[0].text,
+                buttonId: candidates[0].id
+            };
+        }""")
+    except Exception:
+        return None
+
+
+def _close_still_processing_dialog(page) -> Optional[dict]:
+    """Close YouTube's still-processing upload dialog with the exact close button."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    selector = 'ytcp-uploads-still-processing-dialog ytcp-button#close-button'
+    dialog_selector = 'ytcp-uploads-still-processing-dialog'
+
+    def _still_visible() -> bool:
+        try:
+            return page.locator(dialog_selector).first.is_visible(timeout=800)
+        except PWTimeout:
+            return False
+        except Exception:
+            return False
+
+    try:
+        close_btn = page.locator(selector).first
+        if close_btn.is_visible(timeout=800):
+            close_btn.click(timeout=5_000, force=True)
+            page.wait_for_timeout(800)
+            if not _still_visible():
+                return {"clicked": True, "dismissed": True, "method": "playwright-close-button"}
+    except Exception:
+        pass
+
+    try:
+        box = page.evaluate("""() => {
+            const dialog = document.querySelector('ytcp-uploads-still-processing-dialog');
+            if (!dialog) return null;
+            const btn = dialog.querySelector('ytcp-button#close-button') || dialog.querySelector('#close-button');
+            if (!btn) return null;
+            const target =
+                btn.querySelector('ytcp-button-shape button') ||
+                btn.querySelector('button[aria-label="关闭"], button[aria-label="Close"]') ||
+                btn.querySelector('button, [role="button"]') ||
+                btn;
+            const r = target.getBoundingClientRect();
+            if (!r.width || !r.height) return null;
+            return {
+                x: Math.max(1, Math.min(window.innerWidth - 1, r.left + r.width / 2)),
+                y: Math.max(1, Math.min(window.innerHeight - 1, r.top + r.height / 2)),
+                text: target.innerText || target.textContent || btn.innerText || btn.textContent || '',
+                tag: target.tagName
+            };
+        }""")
+        if box:
+            page.mouse.move(box["x"], box["y"])
+            page.wait_for_timeout(100)
+            page.mouse.down()
+            page.wait_for_timeout(80)
+            page.mouse.up()
+            page.wait_for_timeout(800)
+            if not _still_visible():
+                return {"clicked": True, "dismissed": True, "method": "mouse-center", "box": box}
+    except Exception:
+        pass
+
+    try:
+        focused = page.evaluate("""() => {
+            const dialog = document.querySelector('ytcp-uploads-still-processing-dialog');
+            if (!dialog) return false;
+            const btn = dialog.querySelector('ytcp-button#close-button') || dialog.querySelector('#close-button');
+            if (!btn) return false;
+            const target =
+                btn.querySelector('ytcp-button-shape button') ||
+                btn.querySelector('button[aria-label="关闭"], button[aria-label="Close"]') ||
+                btn.querySelector('button, [role="button"]') ||
+                btn;
+            try { target.focus(); } catch (_) {}
+            return true;
+        }""")
+        if focused:
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(500)
+            if not _still_visible():
+                return {"clicked": True, "dismissed": True, "method": "focus-enter"}
+            page.keyboard.press("Space")
+            page.wait_for_timeout(800)
+            if not _still_visible():
+                return {"clicked": True, "dismissed": True, "method": "focus-space"}
+    except Exception:
+        pass
+
+    try:
+        return page.evaluate("""async () => {
+            function visible(el) {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+            }
+            function fireClick(el) {
+                if (!el) return false;
+                try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+                for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    try {
+                        const EventClass = type.startsWith('pointer') && window.PointerEvent ? PointerEvent : MouseEvent;
+                        el.dispatchEvent(new EventClass(type, {
+                            bubbles: true,
+                            cancelable: true,
+                            composed: true,
+                            view: window,
+                            pointerId: 1,
+                            pointerType: 'mouse',
+                            isPrimary: true,
+                            button: 0,
+                            buttons: type.endsWith('down') ? 1 : 0
+                        }));
+                    } catch (_) {}
+                }
+                try { el.click(); } catch (_) {}
+                return true;
+            }
+            function clickCenter(el) {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                const x = Math.max(1, Math.min(window.innerWidth - 1, r.left + r.width / 2));
+                const y = Math.max(1, Math.min(window.innerHeight - 1, r.top + r.height / 2));
+                const top = document.elementFromPoint(x, y) || el;
+                fireClick(top);
+                return true;
+            }
+
+            const dialog = document.querySelector('ytcp-uploads-still-processing-dialog');
+            if (!dialog || !visible(dialog)) {
+                return { clicked: false, dismissed: true, reason: 'not_visible' };
+            }
+            const btn = dialog.querySelector('ytcp-button#close-button') || dialog.querySelector('#close-button');
+            if (!btn) {
+                return { clicked: false, dismissed: false, reason: 'close_button_not_found' };
+            }
+            const inner =
+                (btn.shadowRoot && (btn.shadowRoot.querySelector('button') || btn.shadowRoot.querySelector('[role="button"]'))) ||
+                btn.querySelector('button, [role="button"]') ||
+                btn;
+            fireClick(btn);
+            if (inner !== btn) fireClick(inner);
+            clickCenter(inner);
+            clickCenter(btn);
+            await new Promise(resolve => setTimeout(resolve, 800));
+            return {
+                clicked: true,
+                dismissed: !(document.contains(dialog) && visible(dialog)),
+                method: 'js-close-button'
+            };
+        }""")
+    except Exception:
+        return None
+
+
+def _select_upload_visibility(page, visibility: str, on_log: Callable) -> bool:
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    visibility = (visibility or "PUBLIC").strip().upper()
+    label = {"PUBLIC": "公开", "UNLISTED": "不公开", "PRIVATE": "私享"}.get(visibility, visibility)
+    on_log(f"设置公开范围：{label}...")
+    try:
+        page.wait_for_selector(
+            f'tp-yt-paper-radio-button[name="{visibility}"], '
+            f'ytcp-video-visibility-select tp-yt-paper-radio-button[name="{visibility}"]',
+            timeout=10_000
+        )
+        select_result = page.evaluate("""(name) => {
+            const radios = Array.from(document.querySelectorAll(
+                'ytcp-video-visibility-select tp-yt-paper-radio-button, tp-yt-paper-radio-button'
+            ));
+            const radio = radios.find(r => (r.getAttribute('name') || '').toUpperCase() === name);
+            if (!radio) return 'not-found';
+            const target =
+                radio.querySelector('#radioContainer') ||
+                radio.querySelector('#offRadio') ||
+                radio.querySelector('#onRadio') ||
+                (radio.shadowRoot && (
+                    radio.shadowRoot.querySelector('#radioContainer') ||
+                    radio.shadowRoot.querySelector('#offRadio') ||
+                    radio.shadowRoot.querySelector('#onRadio')
+                )) ||
+                radio;
+            target.click();
+            radio.click();
+            const checked =
+                radio.getAttribute('aria-checked') === 'true' ||
+                radio.hasAttribute('checked') ||
+                radio.classList.contains('iron-selected');
+            return checked ? 'selected' : 'clicked';
+        }""", visibility)
+        page.wait_for_timeout(300)
+        on_log(f"  ✓ 已选择{label}（{select_result}）")
+        return True
+    except PWTimeout:
+        on_log(f"  ⚠️ 未找到「{label}」选项，请手动选择")
+        return False
+
+
 def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
                                   on_progress: Callable,
                                   upload_timeout: int,
-                                  stall_timeout_min: int = 10) -> Optional[str]:
+                                  stall_timeout_min: int = 10,
+                                  upload_state: dict = None) -> Optional[str]:
     from playwright.sync_api import TimeoutError as PWTimeout
 
+    upload_state = upload_state or {}
+    upload_state.setdefault("app_pct", 60)
     start = time.time()
-    on_log("等待上传进度...")
+    on_log("等待公开范围页左下角上传状态...")
 
-    last_pct = 60
+    last_pct = int(upload_state.get("app_pct", 60) or 60)
     last_log_pct = -1
-    last_activity = time.time()   # 最近一次有变化的时间
+    last_activity = float(upload_state.get("last_activity") or time.time())   # 最近一次有变化的时间
     stall_sec = stall_timeout_min * 60 if stall_timeout_min > 0 else 0
+    upload_complete = bool(upload_state.get("complete"))
+    if upload_complete:
+        on_log("前置监控已确认文件上传完成，立即进入公开范围设置")
 
     while True:
         if job.is_cancelled():
@@ -1006,35 +2433,41 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
             return None
 
         # 卡住检测：stall_timeout_min 分钟无任何进度变化
-        if stall_sec > 0 and (time.time() - last_activity) > stall_sec:
+        if not upload_complete and stall_sec > 0 and (time.time() - last_activity) > stall_sec:
             on_log(f"⚠️ 上传已 {stall_timeout_min} 分钟无进度，判定为卡住")
             return _STALL
 
-        pct_result = page.evaluate("""() => {
-            function searchInShadow(root) {
-                const text = root.innerText || root.textContent || '';
-                const m = text.match(/(\\d+)\\s*%/);
-                if (m) { const n = parseInt(m[1]); if (n >= 0 && n <= 100) return n; }
-                for (const el of root.querySelectorAll('*')) {
-                    if (el.shadowRoot) { const r = searchInShadow(el.shadowRoot); if (r !== null) return r; }
-                }
-                return null;
-            }
-            const comp = document.querySelector('ytcp-video-upload-progress');
-            if (comp) { const r = searchInShadow(comp.shadowRoot || comp); if (r !== null) return r; }
-            return null;
-        }""")
+        if upload_complete:
+            break
 
-        if pct_result is not None:
-            mapped = 60 + int(pct_result * 0.22)
-            if pct_result != last_log_pct:
-                on_log(f"上传进度: {pct_result}%")
-                last_log_pct = pct_result
+        if not upload_complete:
+            info = _read_upload_progress(page)
+            phase = info.get("phase") if info else None
+            pct_result = info.get("pct") if info else None
+
+            if phase in ("checking", "processing", "complete"):
+                upload_complete = True
+                upload_state["complete"] = True
                 last_activity = time.time()
-            on_progress(mapped)
-            last_pct = mapped
-            page.wait_for_timeout(2000)
-            continue
+                on_log("检测到 YouTube 已进入上传完毕/检查/处理阶段，立即进入公开范围设置")
+                break
+            elif pct_result is not None and phase in ("uploading", "unknown"):
+                mapped = min(82, 60 + int(pct_result * 0.22))
+                if pct_result != last_log_pct:
+                    on_log(f"上传进度: {pct_result}%")
+                    last_log_pct = pct_result
+                    last_activity = time.time()
+                _emit_upload_progress(upload_state, mapped, on_progress)
+                last_pct = max(last_pct, int(upload_state.get("app_pct", mapped)))
+                if pct_result >= 100:
+                    upload_complete = True
+                    upload_state["complete"] = True
+                    last_activity = time.time()
+                    on_log("上传进度已到 100%，立即进入公开范围设置...")
+                    break
+                else:
+                    page.wait_for_timeout(2000)
+                    continue
 
         processing_result = page.evaluate("""() => {
             const t = document.body.innerText || '';
@@ -1045,22 +2478,10 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
         if processing_result:
             last_activity = time.time()  # 处理中=有活动
             if last_pct < 82:
-                on_log("视频处理/检查中，检查发布按钮是否可用...")
-                on_progress(82)
-                last_pct = 82
-            try:
-                publish_btn = page.locator(
-                    'ytcp-button#done-button:has-text("发布"), '
-                    'ytcp-button:has-text("Publish"), '
-                    'ytcp-button#done-button'
-                ).first
-                if publish_btn.is_enabled(timeout=1000):
-                    on_log("发布按钮已可用（处理中状态），直接发布...")
-                    break
-            except PWTimeout:
-                pass
-            page.wait_for_timeout(2000)
-            continue
+                on_log("视频处理/检查中，立即进入公开范围设置...")
+                _emit_upload_progress(upload_state, 82, on_progress)
+                last_pct = max(last_pct, int(upload_state.get("app_pct", 82)))
+            break
 
         try:
             publish_btn = page.locator(
@@ -1076,59 +2497,104 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
 
         page.wait_for_timeout(2000)
 
-    on_progress(83)
-    on_log("上传完毕，设置公开范围...")
+    _emit_upload_progress(upload_state, 83, on_progress)
+    on_log("上传完毕，准备点击发布/保存...")
 
-    # 公开范围 radio：PUBLIC / UNLISTED / PRIVATE
-    _vis_label = {"PUBLIC": "公开", "UNLISTED": "不公开", "PRIVATE": "私享"}.get(visibility, visibility)
-    try:
-        page.wait_for_selector(
-            f'tp-yt-paper-radio-button[name="{visibility}"], '
-            f'ytcp-video-visibility-select tp-yt-paper-radio-button[name="{visibility}"]',
-            timeout=10_000
-        )
-        page.click(
-            f'tp-yt-paper-radio-button[name="{visibility}"], '
-            f'ytcp-video-visibility-select tp-yt-paper-radio-button[name="{visibility}"]',
-            timeout=8_000
-        )
-        page.wait_for_timeout(500)
-        on_log(f"  ✓ 已选择{_vis_label}")
-    except PWTimeout:
-        on_log(f"  ⚠️ 未找到「{_vis_label}」选项，请手动选择")
-
-    on_log("点击发布...")
+    _action_label = "发布" if (visibility or "").strip().upper() == "PUBLIC" else "保存"
+    on_log(f"点击{_action_label}...")
+    _publish_clicked = False
+    _publish_clicked_at = 0.0
     try:
         publish_btn = page.locator(
             'ytcp-button#done-button:has-text("发布"), '
             'ytcp-button:has-text("Publish"), '
             'ytcp-button#done-button'
         ).first
-        publish_btn.click(timeout=15_000)
+        publish_btn.click(timeout=180_000)
+        _publish_clicked = True
+        _publish_clicked_at = time.time()
         page.wait_for_timeout(2000)
     except PWTimeout:
-        on_log("⚠️ 未找到发布按钮")
+        on_log(f"⚠️ {_action_label}按钮长时间不可用")
         return None
 
-    # 处理确认弹窗（"我们仍在检查你的视频" → 再次点击"发布"）
-    try:
-        confirm_btn = page.locator('ytcp-prechecks-warning-dialog ytcp-button#secondary-action-button')
-        if confirm_btn.is_visible(timeout=5_000):
-            on_log("检测到发布确认弹窗，点击确认发布...")
-            confirm_btn.click(timeout=8_000)
-            page.wait_for_timeout(1500)
-            on_log("  ✓ 已确认发布")
-    except PWTimeout:
-        pass  # 没有弹窗，正常继续
+    # 处理确认弹窗（"我们仍在检查你的视频" → 再次点击弹窗里的"发布"）
+    confirm_result = _click_precheck_publish_dialog(page)
+    if confirm_result and confirm_result.get("clicked"):
+        if confirm_result.get("dismissed"):
+            on_log("检测到检查确认弹窗，已点击发布并关闭弹窗")
+        else:
+            on_log("检测到检查确认弹窗，已尝试点击发布，等待 YouTube 响应...")
+        _publish_clicked_at = time.time()
+        page.wait_for_timeout(1500)
+    elif confirm_result and confirm_result.get("visible"):
+        on_log("检测到检查确认弹窗，等待弹窗里的发布按钮可用...")
 
     video_id = None
     _dialog_closed = False  # 标记弹窗是否已成功关闭（弹窗关闭=发布完成）
 
-    # 处理"正在处理视频"弹窗：轮询等待，最多等 60 秒让弹窗出现
+    # 处理"正在检查/正在处理"弹窗：完整流程可能会检查较久，持续重试弹窗里的发布按钮。
     # 背景：点"确认发布"后 YouTube 需要数秒才弹出此弹窗，且弹窗存在时 URL 不会跳转
     on_log("等待发布后弹窗或页面跳转...")
-    _still_processing_deadline = time.time() + 60
+    _still_processing_deadline = time.time() + 600
+    _precheck_wait_logged = False
+    _last_precheck_click_log = 0.0
     while time.time() < _still_processing_deadline:
+        _dialog_visible = page.evaluate("""() => {
+            const d = document.querySelector('ytcp-uploads-still-processing-dialog');
+            return d && d.offsetParent !== null;
+        }""")
+        if _dialog_visible:
+            on_log("检测到正在处理/上传弹窗，提取视频ID并关闭...")
+            try:
+                _href = page.evaluate("""() => {
+                    const d = document.querySelector('ytcp-uploads-still-processing-dialog');
+                    if (!d) return null;
+                    const a = d.querySelector('a[href*="youtu.be"], a[href*="watch?v="]');
+                    return a ? a.href : null;
+                }""")
+                if _href:
+                    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})|v=([A-Za-z0-9_-]{11})", _href)
+                    if m:
+                        video_id = m.group(1) or m.group(2)
+                        on_log(f"  从弹窗取到 video_id: {video_id}")
+            except Exception:
+                pass
+            closed = _close_still_processing_dialog(page)
+            on_log(f"  关闭处理弹窗点击结果: {closed}")
+            if closed and closed.get("dismissed"):
+                page.wait_for_timeout(1500)
+                on_log("  ✓ 已关闭正在处理/上传弹窗")
+                _dialog_closed = True
+                break
+            on_log("  ⚠️ 正在处理/上传弹窗仍在，继续尝试关闭...")
+            page.wait_for_timeout(2000)
+            continue
+
+        confirm_result = _click_precheck_publish_dialog(page)
+        if confirm_result and confirm_result.get("clicked"):
+            _publish_clicked_at = time.time()
+            if confirm_result.get("dismissed"):
+                on_log("检测到检查确认弹窗，已点击发布并关闭弹窗")
+                page.wait_for_timeout(1500)
+                continue
+            now = time.time()
+            if now - _last_precheck_click_log > 10:
+                on_log("检测到检查确认弹窗，已尝试点击发布，继续等待弹窗关闭...")
+                _last_precheck_click_log = now
+            page.wait_for_timeout(2500)
+            continue
+        if confirm_result and confirm_result.get("visible"):
+            if not _precheck_wait_logged:
+                reason = confirm_result.get("reason") or "waiting"
+                if reason == "button_not_found":
+                    on_log("检查确认弹窗仍在，但暂未找到弹窗里的发布按钮，继续等待...")
+                else:
+                    on_log("检查确认弹窗仍在，继续等待 YouTube 检查或弹窗按钮出现...")
+                _precheck_wait_logged = True
+            page.wait_for_timeout(2000)
+            continue
+
         # ── 检测"视频发布时间"分享弹窗（上传很快时直接跳过检查阶段会出现此弹窗）──
         _share_info = page.evaluate("""() => {
             const d = document.querySelector('ytcp-video-share-dialog');
@@ -1184,24 +2650,36 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
                         on_log(f"  从弹窗取到 video_id: {video_id}")
             except Exception:
                 pass
-            # 穿透 Shadow DOM 点关闭按钮
-            closed = page.evaluate("""() => {
-                const dialog = document.querySelector('ytcp-uploads-still-processing-dialog');
-                if (!dialog) return false;
-                const inner = dialog.querySelector('button[aria-label="关闭"], button[aria-label="Close"], ytcp-button#close-button button');
-                if (inner) { inner.click(); return 'inner'; }
-                const btn = dialog.querySelector('ytcp-button#close-button');
-                if (btn) { btn.click(); return 'outer'; }
-                return false;
-            }""")
+            closed = _close_still_processing_dialog(page)
             on_log(f"  关闭弹窗点击结果: {closed}")
-            page.wait_for_timeout(1500)
-            on_log("  ✓ 已关闭上传中弹窗")
-            _dialog_closed = True
-            break  # 继续走下面的方法取 video_id
+            if closed and closed.get("dismissed"):
+                page.wait_for_timeout(1500)
+                on_log("  ✓ 已关闭上传中弹窗")
+                _dialog_closed = True
+                break  # 继续走下面的方法取 video_id
+            on_log("  ⚠️ 上传中弹窗仍在，继续尝试关闭...")
+            page.wait_for_timeout(2000)
+            continue
         # 检查 URL 是否已跳转（有时没有弹窗直接跳转）
         if re.search(r"studio\.youtube\.com/video/([A-Za-z0-9_-]{11})", page.url):
             break
+        # 有些账号发布后不会弹分享/处理中弹窗，而是直接关闭上传窗口。
+        # 只要发布按钮点击成功，上传窗口已关闭就视为发布完成，避免误判失败后刷新重传。
+        if _publish_clicked and time.time() - _publish_clicked_at > 8:
+            try:
+                _upload_dialog_visible = page.evaluate("""() => {
+                    const selectors = ['ytcp-uploads-dialog', 'ytcp-video-upload-dialog'];
+                    return selectors.some(sel => {
+                        const d = document.querySelector(sel);
+                        return d && d.offsetParent !== null;
+                    });
+                }""")
+                if not _upload_dialog_visible:
+                    on_log("上传发布窗口已关闭，按发布成功处理")
+                    _dialog_closed = True
+                    break
+            except Exception:
+                pass
         page.wait_for_timeout(1000)
 
     # 方法1：等待 URL 跳转到 /video/VIDEO_ID（弹窗已关闭则跳过此等待）
@@ -1402,6 +2880,16 @@ def _click_next(page, timeout: int):
                    timeout=timeout)
 
 
+def _is_upload_visibility_page(page) -> bool:
+    try:
+        return bool(page.evaluate("""() => {
+            return !!document.querySelector('ytcp-video-visibility-select') ||
+                !!document.querySelector('tp-yt-paper-radio-button[name="PUBLIC"]');
+        }"""))
+    except Exception:
+        return False
+
+
 def _is_port_open(port: int) -> bool:
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=1):
@@ -1412,11 +2900,16 @@ def _is_port_open(port: int) -> bool:
 
 def _select_file_via_dialog(page, video_path: Path, on_log: Callable, timeout: int):
     """
-    点击上传按钮后，系统原生文件对话框弹出，
-    用 ctypes SendMessage 向对话框的文件名编辑框直接写入路径。
-    connect_over_cdp 模式下不能传输 >50MB 文件，只能走原生对话框。
-    若未检测到对话框返回 False，由上层决定是否重试整个上传流程。
+    macOS/Linux 直接用 Playwright file chooser 设置本地路径。
+    Windows 保留原生文件对话框注入逻辑，兼容原先的大文件流程。
+    失败时返回 False，由上层决定是否重试整个上传流程。
     """
+    video_path = Path(video_path).expanduser().resolve()
+    if not video_path.exists():
+        on_log(f"  ✗ 视频文件不存在: {video_path}")
+        return False
+    if os.name != "nt":
+        return _select_file_with_playwright(page, video_path, on_log, timeout)
     import ctypes
     import ctypes.wintypes
 
@@ -1425,6 +2918,8 @@ def _select_file_via_dialog(page, video_path: Path, on_log: Callable, timeout: i
 
 def _close_stale_file_dialogs():
     """关闭所有残留的 #32770 文件选择对话框，防止重试时被旧对话框干扰。"""
+    if os.name != "nt":
+        return
     import ctypes
     import ctypes.wintypes
     WM_CLOSE = 0x0010
@@ -1442,6 +2937,36 @@ def _close_stale_file_dialogs():
     user32.EnumWindows(WNDENUMPROC(_enum), 0)
     for hwnd in found:
         user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+
+
+def _select_file_with_playwright(page, video_path: Path, on_log: Callable, timeout: int) -> bool:
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    try:
+        with page.expect_file_chooser(timeout=timeout) as chooser:
+            page.click('ytcp-button#select-files-button, #select-files-button', timeout=timeout)
+        chooser.value.set_files(str(video_path))
+    except PWTimeout:
+        try:
+            file_input = page.locator('input[type="file"]').first
+            file_input.set_input_files(str(video_path), timeout=10_000)
+        except Exception as exc:
+            on_log(f"  ✗ 无法设置上传文件: {exc}")
+            return False
+    except Exception as exc:
+        on_log(f"  ✗ 文件选择失败: {exc}")
+        return False
+
+    try:
+        page.wait_for_selector(
+            'ytcp-video-metadata-editor #title-textarea',
+            timeout=30_000,
+        )
+        on_log("  ✓ 文件已选择")
+        return True
+    except PWTimeout:
+        on_log("  ✗ 文件选择后标题框未出现，将触发重试")
+        return False
 
 
 def _try_select_file_once(page, video_path: Path, on_log: Callable, timeout: int) -> bool:

@@ -1,6 +1,3 @@
-# Web UI
-gradio>=4.40.0
-
 # HTTP / 爬虫
 httpx>=0.27.0
 selectolax>=0.3.21

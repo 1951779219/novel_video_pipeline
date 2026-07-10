@@ -1,4 +1,4 @@
-"""Dependency detection and repair helpers for distributed Windows PCs.
+"""Dependency detection and repair helpers for distributed Windows/macOS PCs.
 
 This module intentionally uses only the Python standard library plus
 app.config, so app.gui can run it before importing httpx/Pillow/edge_tts.
@@ -67,7 +67,6 @@ PYTHON_REQUIREMENTS = [
     PythonRequirement("edge-tts", "edge_tts", "6.1.10", "core"),
     PythonRequirement("Pillow", "PIL", "10.0.0", "core"),
     PythonRequirement("numpy", "numpy", "1.24.0", "core"),
-    PythonRequirement("gradio", "gradio", "4.40.0", "full"),
     PythonRequirement("playwright", "playwright", "1.40.0", "full"),
     PythonRequirement("pyperclip", "pyperclip", "1.8.2", "full"),
     PythonRequirement("pyautogui", "pyautogui", "0.9.54", "full"),
@@ -80,7 +79,7 @@ def ensure_dependencies(*, scope: str = "full", on_log: LogFn | None = None) -> 
 
     scope="core" installs only the packages needed for the desktop GUI to
     import. scope="full" also checks FFmpeg, browser/upload prerequisites and
-    optional WebUI/upload packages.
+    optional browser upload packages.
     """
     scope = "core" if str(scope).lower() == "core" else "full"
     logs: list[str] = []
@@ -108,6 +107,12 @@ def ensure_dependencies(*, scope: str = "full", on_log: LogFn | None = None) -> 
         log("[依赖检测] Python 包正常。")
         python_after = python_before
 
+    tkinter_status = check_tkinter_runtime()
+    if tkinter_status.ok:
+        log("[依赖检测] Tkinter GUI 运行时正常。")
+    else:
+        log("[依赖检测] Tkinter GUI 运行时异常：" + tkinter_status.detail)
+
     ffmpeg = None
     browser = None
     upload_script = None
@@ -121,10 +126,12 @@ def ensure_dependencies(*, scope: str = "full", on_log: LogFn | None = None) -> 
         "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
         "scope": scope,
         "python": [asdict(item) for item in python_after],
+        "tkinter": asdict(tkinter_status),
         "ffmpeg": asdict(ffmpeg) if ffmpeg else None,
         "browser": asdict(browser) if browser else None,
         "upload_script": asdict(upload_script) if upload_script else None,
         "ok": all(item.ok for item in python_after)
+        and tkinter_status.ok
         and (ffmpeg is None or ffmpeg.ok)
         and (browser is None or browser.ok)
         and (upload_script is None or upload_script.ok),
@@ -137,6 +144,35 @@ def ensure_dependencies(*, scope: str = "full", on_log: LogFn | None = None) -> 
 
 def check_python_requirements(*, scope: str = "full") -> list[DependencyStatus]:
     return [_check_python_requirement(req) for req in _selected_requirements(scope)]
+
+
+def check_tkinter_runtime() -> DependencyStatus:
+    proc = _run(
+        [
+            sys.executable,
+            "-c",
+            "import tkinter; print('ok')",
+        ],
+        timeout=20,
+    )
+    if proc.returncode == 0:
+        return DependencyStatus(
+            name="Tkinter GUI runtime",
+            ok=True,
+            detail="ok",
+            path=sys.executable,
+            required="Python with working Tkinter",
+        )
+    detail = _tail(proc.stdout + "\n" + proc.stderr, 1200) or "Tkinter import failed"
+    if "macOS 26" in detail and "have instead 16" in detail:
+        detail += "；macOS 26/Tahoe 上请使用 Homebrew python@3.12 + python-tk@3.12 或 Python.org Python。"
+    return DependencyStatus(
+        name="Tkinter GUI runtime",
+        ok=False,
+        detail=detail,
+        path=sys.executable,
+        required="Python with working Tkinter",
+    )
 
 
 def install_python_requirements(requirements: list[PythonRequirement] | None, log: LogFn) -> None:
@@ -175,7 +211,7 @@ def ensure_ffmpeg(log: LogFn) -> DependencyStatus:
         status.detail = "已关闭 FFmpeg 自动下载"
         return status
     if os.name != "nt":
-        status.detail = "非 Windows 环境暂不自动下载 FFmpeg"
+        status.detail = "macOS 请先运行 scripts/setup_macos.sh，或手动执行 brew install ffmpeg"
         return status
     try:
         _download_and_install_ffmpeg(log)
@@ -193,13 +229,21 @@ def ensure_ffmpeg(log: LogFn) -> DependencyStatus:
 def check_ffmpeg() -> DependencyStatus:
     ffmpeg = _resolve_executable("ffmpeg")
     ffprobe = _resolve_executable("ffprobe")
-    ok = bool(ffmpeg and ffprobe and _exe_works(ffmpeg, ["-version"]) and _exe_works(ffprobe, ["-version"]))
+    ffmpeg_ok = bool(ffmpeg and _exe_works(ffmpeg, ["-version"]))
+    ffprobe_ok = bool(ffprobe and _exe_works(ffprobe, ["-version"]))
+    ok = bool(ffmpeg_ok and (ffprobe_ok or os.name != "nt"))
+    if ffmpeg_ok and not ffprobe_ok and os.name != "nt":
+        detail = "ffprobe missing; duration detection will use ffmpeg fallback"
+    elif ok:
+        detail = "ok"
+    else:
+        detail = "missing"
     return DependencyStatus(
         name="FFmpeg / FFprobe",
         ok=ok,
-        detail="ok" if ok else "missing",
+        detail=detail,
         path=str(ffmpeg or ""),
-        required="ffmpeg.exe + ffprobe.exe",
+        required="ffmpeg + ffprobe",
     )
 
 
@@ -208,7 +252,7 @@ def ensure_browser(log: LogFn) -> DependencyStatus:
     if status.ok:
         log(f"[依赖检测] 浏览器正常：{status.path}")
         return status
-    log("[依赖检测] 未找到 Chrome。YouTube 上传需要 Chrome 调试模式。")
+    log("[依赖检测] 未找到 Chrome/Chromium。YouTube 上传需要调试模式浏览器。")
     if not bool(config.get("dependency_auto_install_browser", False)):
         status.detail = "未开启浏览器自动安装；可在配置中开启，或手动安装 Chrome。"
         return status
@@ -237,12 +281,12 @@ def ensure_browser(log: LogFn) -> DependencyStatus:
 def check_browser() -> DependencyStatus:
     chrome = _find_chrome()
     if chrome:
-        return DependencyStatus(name="Chrome", ok=True, path=str(chrome), detail="ok", required="Chrome")
+        return DependencyStatus(name="Chrome / Chromium", ok=True, path=str(chrome), detail="ok", required="Chrome or Chromium")
     edge = _find_edge()
-    detail = "Chrome missing"
+    detail = "Chrome/Chromium missing"
     if edge:
         detail += f"; Edge exists at {edge}"
-    return DependencyStatus(name="Chrome", ok=False, path="", detail=detail, required="Chrome")
+    return DependencyStatus(name="Chrome / Chromium", ok=False, path="", detail=detail, required="Chrome or Chromium")
 
 
 def ensure_upload_script(log: LogFn) -> DependencyStatus:
@@ -267,6 +311,9 @@ def summarize_report(report: dict[str, Any]) -> str:
     missing_py = [item["name"] for item in py_items if not item.get("ok")]
     parts = []
     parts.append("Python包正常" if not missing_py else "Python包缺失：" + ", ".join(missing_py))
+    tkinter = report.get("tkinter")
+    if tkinter:
+        parts.append(f"Tkinter{'正常' if tkinter.get('ok') else '异常'}")
     for key, label in [("ffmpeg", "FFmpeg"), ("browser", "Chrome"), ("upload_script", "上传脚本")]:
         item = report.get(key)
         if item:
@@ -340,6 +387,15 @@ def _resolve_executable(name: str) -> Path | None:
     found = shutil.which(name)
     if found:
         candidates.append(Path(found))
+    if os.name != "nt":
+        candidates.extend(
+            [
+                Path.home() / ".local" / "bin" / name,
+                Path("/opt/homebrew/bin") / name,
+                Path("/usr/local/bin") / name,
+                Path("/usr/bin") / name,
+            ]
+        )
     candidates.extend(
         [
             ROOT / "runtime" / "ffmpeg" / exe,
@@ -350,7 +406,7 @@ def _resolve_executable(name: str) -> Path | None:
         ]
     )
     for path in candidates:
-        if path and path.exists():
+        if path and path.exists() and (os.name == "nt" or os.access(path, os.X_OK)):
             return path
     return None
 
@@ -435,7 +491,12 @@ def _exe_works(path: Path, args: list[str]) -> bool:
 
 def _find_chrome() -> Path | None:
     candidates = []
-    found = shutil.which("chrome") or shutil.which("chrome.exe")
+    found = (
+        shutil.which("google-chrome")
+        or shutil.which("chrome")
+        or shutil.which("chromium")
+        or shutil.which("chrome.exe")
+    )
     if found:
         candidates.append(Path(found))
     if os.name == "nt":
@@ -443,7 +504,30 @@ def _find_chrome() -> Path | None:
             base = os.environ.get(env)
             if base:
                 candidates.append(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe")
-    return next((path for path in candidates if path.exists()), None)
+    elif sys.platform == "darwin":
+        candidates.extend(
+            [
+                Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                Path.home() / "Applications" / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome",
+                Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+                Path.home() / "Applications" / "Chromium.app" / "Contents" / "MacOS" / "Chromium",
+            ]
+        )
+    found_path = next((path for path in candidates if path.exists()), None)
+    return found_path or _find_playwright_chromium()
+
+
+def _find_playwright_chromium() -> Path | None:
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as pw:
+            path = Path(pw.chromium.executable_path)
+        if path.exists():
+            return path
+    except Exception:
+        return None
+    return None
 
 
 def _find_edge() -> Path | None:
@@ -456,11 +540,20 @@ def _find_edge() -> Path | None:
             base = os.environ.get(env)
             if base:
                 candidates.append(Path(base) / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+    elif sys.platform == "darwin":
+        candidates.extend(
+            [
+                Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                Path.home() / "Applications" / "Microsoft Edge.app" / "Contents" / "MacOS" / "Microsoft Edge",
+            ]
+        )
     return next((path for path in candidates if path.exists()), None)
 
 
 def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         return subprocess.run(
             args,
@@ -470,7 +563,7 @@ def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
             encoding="utf-8",
             errors="ignore",
             timeout=timeout,
-            creationflags=flags,
+            **kwargs,
         )
     except Exception as exc:
         return subprocess.CompletedProcess(args, 1, "", str(exc))

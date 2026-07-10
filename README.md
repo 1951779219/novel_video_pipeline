@@ -1,14 +1,40 @@
 # 小说推文长视频流水线
 
-把小说/推文文本变成长视频：内容抓取 -> 清洗切片 -> TTS -> 分镜出图 -> 字幕 -> 竖屏视频 -> 可选上传 YouTube。
+把小说/推文文本变成长视频：内容抓取 -> 整理/洗稿切片 -> TTS -> 分镜出图 -> 字幕 -> 竖屏视频 -> 可选上传 YouTube。
 
 当前版本重点增强了三件事：
 
 - 国内内容来源：内置晴天/番茄聚合接口，支持番茄、七猫、书旗、塔读、QQ 阅读等聚合来源搜索与抓取。
 - 阅读/Legado 兼容：提供 `legado_static` 轻量解析器，可导入普通静态 JSON 书源；复杂 `<js>` 书源由专用聚合引擎处理。
 - 长视频稳定性：后台任务、`status.json`、`log.txt`、已有音频/图片复用、长视频 ffmpeg 单次图片清单合成、内嵌 ASS + 外置 SRT 字幕。
+- 人设与剧情图提示词：导入 v1.0.18 的人设分析、视觉主题锁、剧情图人物锁和可选参考图链路；生成任务会写入 `character_profiles.json`、`character_reference_manifest.json` 和带 `character_context` / `theme_context` 的 `prompts.json`。
+
+## 文档入口
+
+- 模块和提示词修改教程：`docs/module_prompt_editing_guide.md`
+- 浏览器多账号上传：`docs/browser_multi_account_upload.md`
+- GitHub 线上更新发布：`docs/online_update_github.md`
+- 分包机器 agent 升级说明：`docs/agent_upgrade_playbook.md`
+- Agent 快速索引：`AGENTS.md`
+- 提示词示例：`docs/tweet_prompt_templates.md`
 
 ## 启动
+
+macOS 首次使用：
+
+```bash
+cd "/Users/yang/Documents/novel video pipelin"
+scripts/setup_macos.sh
+```
+
+之后可双击或运行：
+
+```bash
+scripts/start_gui_macos.command
+./Open_GUI.command
+```
+
+复制到其他 Mac 使用时，建议先运行 `scripts/setup_macos.sh`，之后固定双击 `Open_GUI.command`。应用默认启动桌面 GUI，不需要 WebUI 常驻进程。
 
 双击：
 
@@ -16,10 +42,10 @@
 启动.bat
 ```
 
-或在项目目录运行：
+或在项目目录运行桌面 GUI：
 
 ```bat
-python -m app.webui
+python -m app.gui
 ```
 
 生产使用建议启动桌面 GUI：
@@ -30,13 +56,167 @@ python -m app.webui
 
 桌面 GUI 面向工作人员批量生产：支持番茄搜索加入任务、粘贴文章、导入多个 TXT、查看每个任务实时日志、保存 TTS/图片/节奏/字幕/上传配置、启动多个待处理任务。任务仍然走独立 worker 进程和 manifest 续跑机制。
 
+如果电脑开了系统代理，启动脚本会自动设置 `NO_PROXY=localhost,127.0.0.1,::1`，避免本地接口调用被代理拦截。
+macOS 启动脚本还会把 `/opt/homebrew/bin`、`/usr/local/bin` 和 `~/.local/bin` 加进 PATH，方便从 Finder/双击启动时找到 `ffmpeg`、`ffprobe` 和本地 AI 服务命令。
+
+### macOS 26/Tahoe Tkinter 启动错误
+
+如果双击后出现：
+
+```text
+macOS 26 (...) or later required, have instead 16 (...) !
+zsh: abort
+```
+
+这是当前 Python/Tk GUI 运行时不兼容，不是小说流水线任务本身失败。启动脚本会自动检测并尝试重建 `.venv`。如果仍失败，请在那台 Mac 上安装带 Tk 支持的 Python 后再双击：
+
+```bash
+./Install_Mac_Dependencies.command
+```
+
+如果安装器提示没有 Homebrew，先安装 Homebrew：
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+新版 `Install_Mac_Dependencies.command` 也可以在没有 Homebrew 时直接询问并运行官方 Homebrew 安装器。Homebrew 安装完成后，它会继续安装 GUI 需要的 Python/Tk/FFmpeg。也可以手动运行：
+
+```bash
+brew install python@3.12 python-tk@3.12 ffmpeg
+```
+
+也可以指定 Python.org 安装版：
+
+```bash
+export NOVEL_VIDEO_PYTHON=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+./Open_GUI.command
+```
+
+## 人设与剧情图提示词
+
+GUI 的“图片与提示词”区域现在包含：
+
+- `文本/生图共用统一 API`：Base URL/API Key 只填一次，文本模型和图片模型分别选择；分镜、洗稿、人设、剧情图、封面默认继承。
+- `AI 人设分析`：从文章里提取主角、配角、视觉主题和固定外观规则。
+- `生成人设参考图`：可选，为主角/重要配角先生成全身参考图。
+- `剧情图注入视觉主题` / `剧情图注入人物锁`：把统一画风和人物外观锁拼进每张剧情图提示词。
+- `剧情图使用人设参考图`：OpenAI 兼容接口会走 `/images/edits`，SD WebUI 会走 `img2img`；其他后端自动退回普通文生图。
+
+## Seedance 无限画布短视频钩子
+
+macOS 可双击或运行：
+
+```bash
+scripts/start_seedance_canvas_macos.command
+```
+
 打开：
 
 ```text
-http://127.0.0.1:7860
+http://127.0.0.1:7871
 ```
 
-如果电脑开了系统代理，启动脚本会自动设置 `NO_PROXY=localhost,127.0.0.1,::1`，避免 Gradio 自检 localhost 时被代理拦截。
+页面里粘贴文案，填写 Seedance API Key、Base URL、模型名、比例和秒数后，可先“生成方案”，再“生成短视频”。默认使用火山方舟/Ark 风格接口：
+
+```text
+POST {base_url}/contents/generations/tasks
+GET  {base_url}/contents/generations/tasks/{task_id}
+```
+
+如果不想在页面里填 Key，也可以在启动前设置：
+
+```bash
+export SEEDANCE_API_KEY="你的 key"
+export SEEDANCE_MODEL="doubao-seedance-2-0-fast-260128"
+export SEEDANCE_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"
+```
+
+每次任务会写入：
+
+```text
+data/seedance_canvas/jobs/{job_id}/
+  script.txt
+  seedance_prompt.txt
+  plan.json
+  tweet_hook.json
+  result.json
+  *.mp4
+```
+
+画布操作：
+
+- 拖动卡片标题栏可移动节点，空白处拖动可平移画布，滚轮可缩放。
+- 节点位置保存在浏览器本地，刷新页面后仍会保留。
+
+### AI 转提示词、人设图和九宫图
+
+页面支持两类额外 API：
+
+- 语言 AI：OpenAI 兼容 `/chat/completions` 或 Claude `/messages`，用于把文章转成 `video_prompt`、人设图提示词和九宫图分镜提示词。
+- 图片模型：OpenAI 兼容 `/images/generations` 中转站，或本地占位图模式，用于生成角色人设图和九宫图素材。
+
+Key 不会写入 `data/seedance_canvas/settings.json`；也可以用环境变量：
+
+```bash
+export PROMPT_LLM_API_KEY="语言 AI key"
+export IMAGE_API_KEY="图片模型 key"
+```
+
+接口：
+
+```text
+POST http://127.0.0.1:7871/api/ai_prompts
+POST http://127.0.0.1:7871/api/reference_images
+```
+
+`/api/reference_images` 支持：
+
+```json
+{
+  "title": "可空标题",
+  "script": "文章或剧情文案",
+  "mode": "character",
+  "image_provider": "custom",
+  "image_base_url": "https://你的中转站/v1",
+  "image_model": "图片模型名",
+  "image_api_key": "可空，留空读 IMAGE_API_KEY"
+}
+```
+
+`mode` 可填 `character`、`grid` 或 `all`。完成后会在对应 job 目录写入：
+
+```text
+prompt_bundle.json
+character_01.png ...
+grid_01.png ... grid_09.png
+nine_grid.jpg
+reference_images.json
+```
+
+给推文流水线接入的入口是：
+
+```text
+POST http://127.0.0.1:7871/api/tweet_hook
+Content-Type: application/json
+
+{
+  "title": "可空标题",
+  "script": "推文开头或小说剧情文案",
+  "api_key": "可空，留空读 SEEDANCE_API_KEY",
+  "duration": 5,
+  "ratio": "9:16",
+  "resolution": "720p"
+}
+```
+
+服务会返回 `job_id`，任务完成后把同一份 manifest 投递到：
+
+```text
+data/tweet_hooks/inbox/{job_id}.json
+```
+
+推文流水线只需要读取这个 JSON：`hook` / `tweet_thread` 用作开头钩子，`artifacts.video` 用作短视频钩子素材。想先验证不消耗额度，可传 `"dry_run": true`，它只生成 prompt 和 manifest，不调用 Seedance。
 
 ## 内容来源
 
@@ -86,7 +266,10 @@ d:短剧名@番茄
 - `内嵌字幕`: 开启
 - `同时导出 SRT`: 开启
 - `短视频 Ken Burns 动效`: 关闭或让长视频模式自动关闭
-- `TTS 失败后用静音占位`: 开启
+- `TTS 持续重试直到成功`: 开启
+- `TTS 波形校验`: 开启
+- `TTS 卡段提示秒`: 建议 240-360，单段卡住会写日志并由子进程超时重试
+- `TTS 子进程隔离`: 开启，单段超时会杀掉独立合成进程并重试
 
 长视频模式不会为每张图生成单独 mp4 片段，而是用 concat 图片清单一次性合成，减少临时文件数量和崩溃概率。
 
@@ -117,6 +300,7 @@ app/
     qingtian.py       国内聚合接口
     legado.py         普通 Legado 静态 JSON 书源
     syosetu.py        日本 Syosetu
+    kakuyomu.py       日本 Kakuyomu
   backends/
     tts.py
     llm.py
@@ -126,7 +310,6 @@ app/
     stage_pacing.py
     stage6_compose.py
   pipeline_runner.py
-  webui.py
 data/jobs/
 ```
 
@@ -134,9 +317,10 @@ data/jobs/
 
 当前版本已吸收 HUANCUN MVP 中最适合本项目的轻量机制：
 
-- 完整流水线从 WebUI 派发为独立 worker 进程，WebUI 关闭或重启时，已派发的长任务不会因为 Gradio 线程结束而立刻丢失。
+- 完整流水线从桌面 GUI 派发为独立 worker 进程，GUI 关闭或重启时，已派发的长任务不会因为界面进程结束而立刻丢失。
 - `data/runtime/locks/` 提供跨进程资源锁，默认普通电脑只允许 1 个 FFmpeg 任务并发，外部 API 默认 2 路，避免多任务抢满 CPU、内存和接口额度。
 - `data/jobs/{job_id}/audio/tts_manifest.json` 记录每段 TTS 的文本 hash、配置 hash、文件指纹和状态，续跑时优先复用已完成音频。
+- TTS 卡在单段时，GUI 可先停止选中任务，再用“重试TTS段...”重置指定 `seg` 或失败/卡住/波形异常段；也可用“TTS卡段重试推进”重置未完成段并自动重新启动任务。
 - `data/jobs/{job_id}/compose_manifest.json` 记录音频拼接和最终合成输入 hash，合成失败不会覆盖已有 `final.mp4`。
 
 普通配置电脑建议保持：
@@ -148,17 +332,33 @@ Long video stable mode = enabled
 Ken Burns = disabled for very long videos
 ```
 
-FFmpeg 会按顺序查找：`MEDIA_FFMPEG_BIN` / `MEDIA_FFPROBE_BIN` 环境变量、系统 PATH、项目内 `runtime/ffmpeg`、`tools/ffmpeg`、`tools/ffmpeg/bin`、`vendor/ffmpeg`，最后才兼容旧的 `F:\Manao\drama_pipeline_release\tools\ffmpeg`。给普通电脑发包时，把 `ffmpeg.exe` 和 `ffprobe.exe` 放进上述任一项目内目录即可。
+FFmpeg 会按顺序查找：`MEDIA_FFMPEG_BIN` / `MEDIA_FFPROBE_BIN` 环境变量、系统 PATH、macOS 常见 Homebrew/本地路径、项目内 `runtime/ffmpeg`、`tools/ffmpeg`、`tools/ffmpeg/bin`、`vendor/ffmpeg`，最后才兼容旧的 `F:\Manao\drama_pipeline_release\tools\ffmpeg`。Windows 发包时把 `ffmpeg.exe` 和 `ffprobe.exe` 放进上述任一项目内目录即可；macOS 建议安装：
+
+```bash
+brew install ffmpeg
+```
+
+如果只有 `ffmpeg` 没有 `ffprobe`，本版本会用 `ffmpeg -i` 回退读取音频时长，但完整安装仍更稳。
 
 ## YouTube 自动上传
 
-生成后自动上传可在桌面 GUI 的“流水线配置 -> 批量与上传”里开启。当前浏览器上传优先复用：
+生成后自动上传可在桌面 GUI 的“流水线配置 -> 批量与上传”里开启。当前浏览器上传优先使用随包分发的：
 
 ```text
-F:\Manao\drama_pipeline_app\app\stages\stage5_upload_browser.py
+app/vendor/stage5_upload_browser.py
 ```
 
 保留 `simple/full` 两种流程；`full` 流程会按配置尝试上传政策、广告位间隔、广告起始时间和公开范围。使用前需要 Chrome 调试端口 `9222` 可用，并已登录 YouTube Studio。
+
+macOS 启动调试 Chrome：
+
+```bash
+scripts/start_chrome_debug_macos.command
+```
+
+如果本机没有安装 Google Chrome，`scripts/setup_macos.sh` 会下载 Playwright Chromium，调试启动脚本会自动使用它。
+
+上传选择视频和封面时，macOS 会直接通过 Playwright 设置本地文件路径，不依赖原生文件选择框焦点，因此从桌面 GUI 发起上传更稳定。
 
 ## 封面生成
 
@@ -171,7 +371,9 @@ cover.jpg
 cover_manifest.json
 ```
 
-封面提示词会自动带入当前任务标题 `{title}` 和正文摘要 `{excerpt}`，并要求图片模型不要直接绘制文字；最终标题由程序稳定压在图片底部，避免 AI 出图标题乱码。YouTube 自动上传时会优先使用 `cover.jpg`。
+封面提示词会自动带入当前任务标题 `{title}`、正文摘要 `{excerpt}`、通用风格 `{style}` 和自定义方向 `{custom}`。标题会作为提示词的一部分交给图片模型生成到画面里，不再由程序后期压字；YouTube 自动上传时会优先使用 `cover.jpg`。
+
+可直接复制到 GUI 里使用的小说推文封面/视频图提示词示例见 `docs/tweet_prompt_templates.md`。
 
 ## API 检测
 
@@ -196,6 +398,7 @@ POST {base_url}/images/generations
 - 清除图片缓存
 
 “清除图片缓存”会删除选中任务的图片、封面和最终视频，保留抓取文本与 TTS 结果，适合重新调用生图 API 或重新合成。
+“重试TTS段...”只删除选中 TTS 段和受音频时长影响的下游缓存，保留图片；“TTS卡段重试推进”会重置未完成/失败/波形异常段并重新启动任务，不会生成静音占位。
 
 ## 标题与说明模板
 

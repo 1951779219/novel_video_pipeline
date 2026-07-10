@@ -1,0 +1,211 @@
+[
+  {
+    "key": "fanqie",
+    "name": "番茄小说",
+    "region": "fanqie",
+    "content_type": "国内原创小说、推文小说",
+    "url": "https://fanqienovel.com/",
+    "engine": "qingtian",
+    "paid_label": "平台权益/部分付费",
+    "intro": "国内网文平台；本应用通过现有聚合接口搜索可访问作品，付费或登录限制以平台实际页面为准。",
+    "notes": "默认只搜番茄小说，保持和现有采集流程兼容。"
+  },
+  {
+    "key": "aozora",
+    "name": "青空文庫",
+    "region": "japanese",
+    "content_type": "无版权作品、文学作品",
+    "url": "https://www.aozora.gr.jp/",
+    "engine": "catalog",
+    "paid_label": "免费",
+    "intro": "提供各种已无著作权或得到作者许可的文学作品免费阅读服务的网站。",
+    "notes": ""
+  },
+  {
+    "key": "alphapolis",
+    "name": "アルファポリス",
+    "region": "japanese",
+    "content_type": "原创小说/漫画综合平台",
+    "url": "https://www.alphapolis.co.jp/m",
+    "engine": "catalog",
+    "paid_label": "部分付费",
+    "intro": "原创网络小说/漫画平台，部分热门或最新章节可能需要票券或付费。",
+    "notes": "每天¥0、票券、购买章节。"
+  },
+  {
+    "key": "kakuyomu",
+    "name": "カクヨム",
+    "region": "japanese",
+    "content_type": "原创网络小说",
+    "url": "https://kakuyomu.jp/",
+    "engine": "kakuyomu",
+    "paid_label": "免费",
+    "intro": "KADOKAWA 运营的原创网络小说阅读与投稿平台。",
+    "notes": ""
+  },
+  {
+    "key": "noichigo",
+    "name": "野いちご",
+    "region": "japanese",
+    "content_type": "恋爱小说、少女向、青春校园、原创小说、女性向",
+    "url": "https://www.no-ichigo.jp/",
+    "engine": "catalog",
+    "paid_label": "免费",
+    "intro": "以免费阅读和投稿为主，聚焦恋爱与少女向小说的日本原创小说平台。",
+    "notes": ""
+  },
+  {
+    "key": "sai_zen_sen",
+    "name": "最前線 (星海社)",
+    "region": "japanese",
+    "content_type": "官方出版平台、免费公开作品、小说漫画综合平台",
+    "url": "https://sai-zen-sen.jp/",
+    "engine": "catalog",
+    "paid_label": "免费",
+    "intro": "星海社运营的免费网络出版平台，在线公开小说与漫画等原创作品。",
+    "notes": ""
+  },
+  {
+    "key": "syosetu",
+    "name": "小説家になろう",
+    "region": "japanese",
+    "content_type": "轻小说文化中心、原创小说",
+    "url": "https://syosetu.com/",
+    "engine": "syosetu",
+    "paid_label": "免费",
+    "intro": "日本大型原创网络小说投稿与阅读平台。",
+    "notes": "支持关键词搜索和正文采集。"
+  },
+  {
+    "key": "sutekibungei",
+    "name": "ステキブンゲイ",
+    "region": "japanese",
+    "content_type": "一般文艺原创小说",
+    "url": "https://sutekibungei.com/",
+    "engine": "catalog",
+    "paid_label": "免费",
+    "intro": "一般文艺原创小说投稿与免费阅读平台。",
+    "notes": ""
+  },
+  {
+    "key": "novelism",
+    "name": "Novelism",
+    "region": "japanese",
+    "content_type": "原创网络小说、契约作品、付费章节",
+    "url": "https://novelism.jp/",
+    "engine": "catalog",
+    "paid_label": "部分付费",
+    "intro": "原创网络小说投稿与阅读平台，契约作品后续章节可能按话付费。",
+    "notes": "契约作品、章节付费。"
+  },
+  {
+    "key": "novelup",
+    "name": "ノベルアップ＋",
+    "region": "japanese",
+    "content_type": "原创网络小说、互动应援",
+    "url": "https://novelup.plus/",
+    "engine": "catalog",
+    "paid_label": "免费/应援",
+    "intro": "原创网络小说投稿与免费阅读平台，带应援点数和スタンプ互动。",
+    "notes": ""
+  },
+  {
+    "key": "hameln",
+    "name": "ハーメルン",
+    "region": "japanese",
+    "content_type": "原创/二次创作小说、高功能搜索",
+    "url": "https://syosetu.org/",
+    "engine": "catalog",
+    "paid_label": "免费",
+    "intro": "日本用户较多的免费小说投稿网站，原创与二次创作都较丰富。",
+    "notes": ""
+  },
+  {
+    "key": "bookwalker",
+    "name": "BOOK☆WALKER",
+    "region": "japanese",
+    "content_type": "正版电子书、轻小说、漫画、文学作品",
+    "url": "https://bookwalker.jp/st3/",
+    "engine": "catalog",
+    "paid_label": "付费",
+    "intro": "KADOKAWA 系大型官方电子书销售与阅读平台，核心为正版购买与试读。",
+    "notes": "购买、试读、积分、特典。"
+  },
+  {
+    "key": "prcm",
+    "name": "プリ小説 byGMO",
+    "region": "japanese",
+    "content_type": "梦功能、聊天式小说、原创小说、青春/恋爱、女性向",
+    "url": "https://novel.prcm.jp/",
+    "engine": "catalog",
+    "paid_label": "免费",
+    "intro": "聊天对话式小说投稿与阅读平台，支持梦功能和原创小说。",
+    "notes": "网站为手机端格式。"
+  },
+  {
+    "key": "teller",
+    "name": "テラーノベル",
+    "region": "japanese",
+    "content_type": "原创小说、聊天式小说、付费会员/内购、女性向",
+    "url": "https://teller.jp/",
+    "engine": "catalog",
+    "paid_label": "部分付费",
+    "intro": "原创小说阅读与创作平台，部分官方连载或热门作品需要会员或内购解锁。",
+    "notes": "会员、内购。"
+  },
+  {
+    "key": "goodnovel",
+    "name": "GoodNovel",
+    "region": "japanese",
+    "content_type": "原创小说、章节付费、女性向为主",
+    "url": "https://www.goodnovel.com/ja",
+    "engine": "catalog",
+    "paid_label": "付费",
+    "intro": "国际在线网络小说阅读与创作平台，采用章节付费与奖励机制。",
+    "notes": "章节付费。"
+  },
+  {
+    "key": "kindle",
+    "name": "Kindle",
+    "region": "japanese",
+    "content_type": "正版电子书、跨设备同步",
+    "url": "https://read.amazon.com/landing",
+    "engine": "catalog",
+    "paid_label": "付费/借阅",
+    "intro": "亚马逊官方电子书阅读服务，访问购买或借阅的 Kindle 内容。",
+    "notes": "需要 Amazon 账户与对应权益。"
+  },
+  {
+    "key": "berrys_cafe",
+    "name": "ベリーズカフェ",
+    "region": "japanese",
+    "content_type": "原创小说、恋爱小说、女性向",
+    "url": "https://www.berrys-cafe.jp/",
+    "engine": "catalog",
+    "paid_label": "免费",
+    "intro": "以恋爱小说和轻小说为主的原创小说投稿与阅读平台。",
+    "notes": ""
+  },
+  {
+    "key": "uranai",
+    "name": "占いツクール",
+    "region": "japanese",
+    "content_type": "占卜/诊断、原创/二次创作小说、梦小説、女性向",
+    "url": "https://uranai.nosv.org/",
+    "engine": "catalog",
+    "paid_label": "免费",
+    "intro": "结合占卜、小说与趣味诊断的创作与阅读平台。",
+    "notes": ""
+  },
+  {
+    "key": "peep",
+    "name": "peep（ピープ）",
+    "region": "japanese",
+    "content_type": "原创小说/漫画、聊天式小说、视觉化故事、付费服务",
+    "url": "https://peep.jp/",
+    "engine": "catalog",
+    "paid_label": "部分付费",
+    "intro": "原创小说和漫画阅读平台，部分内容通过等待免费、广告或付费服务阅读。",
+    "notes": "等待免费、广告、付费服务。"
+  }
+]

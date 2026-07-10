@@ -27,8 +27,10 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from app.config import JOBS_DIR, ROOT, config
 from app.concurrency import external_api_slot, ffmpeg_slot, pid_alive
 from app.scrapers.base import BookSearchResult, Novel, NovelChapter
+from app.scrapers.kakuyomu import KakuyomuScraper
 from app.scrapers.legado import LegadoStaticScraper
 from app.scrapers.qingtian import QingtianAggregateScraper, parse_host_list
+from app.scrapers.source_catalog import SourceCatalogScraper
 from app.scrapers.syosetu import SyosetuScraper
 from app.stages.stage2_clean import Segment, split_segments
 from app.stages.stage6_compose import build_ass, build_srt, build_video, concat_audios
@@ -45,6 +47,7 @@ from app.character_analysis import (
     visual_theme_context,
 )
 from app.utils.ffmpeg import ffmpeg_path
+from app.utils.secrets import redact_secret_text
 
 
 LogFn = Callable[[str], None]
@@ -65,6 +68,48 @@ def _bounded_timeout(value, default: float, minimum: float = 30.0, maximum: floa
     except Exception:
         seconds = float(default)
     return max(minimum, min(maximum, seconds))
+
+
+def _optional_timeout(value, default: float, minimum: float = 30.0, maximum: float = 7200.0) -> float:
+    try:
+        seconds = float(value if value not in (None, "") else default)
+    except Exception:
+        seconds = float(default)
+    if seconds <= 0:
+        return 0.0
+    return max(minimum, min(maximum, seconds))
+
+
+def _unified_ai_enabled() -> bool:
+    return bool(config.get("ai_api_enabled", True)) and bool(
+        str(config.get("ai_api_base_url", "") or "").strip() or str(config.get("ai_api_key", "") or "").strip()
+    )
+
+
+def _llm_route_settings() -> dict:
+    provider = str(config.llm_provider or "openai").strip().lower()
+    base_url = str(config.llm_base_url or "").strip()
+    api_key = str(config.llm_api_key or "").strip()
+    model = str(config.llm_model or "").strip()
+    if _unified_ai_enabled() and provider in {"openai", "custom", "deepseek", "gemini"}:
+        base_url = str(config.get("ai_api_base_url", "") or base_url).strip()
+        api_key = str(config.get("ai_api_key", "") or api_key).strip()
+        model = str(config.get("ai_api_text_model", "") or model).strip()
+    return {"provider": provider, "base_url": base_url, "api_key": api_key, "model": model}
+
+
+def _can_call_text_llm() -> bool:
+    route = _llm_route_settings()
+    return bool(route["api_key"]) or route["provider"] in {"ollama", "custom"}
+
+
+def _apply_unified_image_api(provider: str, base_url: str, api_key: str, model: str) -> tuple[str, str, str]:
+    provider = str(provider or "").strip().lower()
+    if _unified_ai_enabled() and provider in {"openai", "custom"}:
+        base_url = str(config.get("ai_api_base_url", "") or base_url or "").strip()
+        api_key = str(config.get("ai_api_key", "") or api_key or "").strip()
+        model = str(config.get("ai_api_image_model", "") or model or "").strip()
+    return base_url, api_key, model
 
 
 def _noop(*_args, **_kwargs):
@@ -102,7 +147,7 @@ def job_dir_for(job_id: str) -> Path:
 def append_log(job_dir: Path, message: str):
     job_dir.mkdir(parents=True, exist_ok=True)
     with (job_dir / "log.txt").open("a", encoding="utf-8") as f:
-        f.write(str(message).rstrip() + "\n")
+        f.write(redact_secret_text(message).rstrip() + "\n")
 
 
 def tail_log(job_id: str, lines: int = 240) -> str:
@@ -122,7 +167,7 @@ def write_status(job_dir: Path, **updates):
             current = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             current = {}
-    current.update(updates)
+    current.update({key: redact_secret_text(value) if isinstance(value, str) else value for key, value in updates.items()})
     current["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -144,7 +189,7 @@ _STAGE_LABELS = {
     "queued": "等待启动",
     "starting": "启动中",
     "scrape": "1/6 读取文本",
-    "clean": "2/6 清洗切片",
+    "clean": "2/6 整理/洗稿切片",
     "tts": "3/6 配音",
     "images_prefetch": "4/6 预生成图片",
     "pacing": "4/6 规划画面",
@@ -226,12 +271,6 @@ def _safe_job_path(job_id: str) -> Path:
     if path == root or root not in path.parents:
         raise ValueError(f"unsafe job path: {path}")
     return path
-
-
-def _safe_artifact_name(value: str, fallback: str = "artifact") -> str:
-    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value or "").strip())
-    text = re.sub(r"\s+", "_", text).strip(" ._")
-    return (text[:80].rstrip(" ._") or fallback)
 
 
 def _terminate_process_tree(pid: int, *, timeout_seconds: float = 8.0) -> bool:
@@ -454,6 +493,10 @@ def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = 
 
 
 def _build_scraper(site: str):
+    if site in {"source_catalog", "catalog", "novel_catalog"}:
+        return SourceCatalogScraper()
+    if site == "kakuyomu":
+        return KakuyomuScraper()
     if site == "syosetu":
         return SyosetuScraper()
     if site in {"qingtian", "fanqie", "aggregate"}:
@@ -480,6 +523,8 @@ def search_books(
     site = site or config.scraper_site
     sc = _build_scraper(site)
     try:
+        if isinstance(sc, SourceCatalogScraper):
+            return sc.search(keyword, limit=limit, source=source, media=media, enrich_latest=enrich_latest)
         if isinstance(sc, QingtianAggregateScraper):
             return sc.search(keyword, limit=limit, source=source, media=media, enrich_latest=enrich_latest)
         if isinstance(sc, LegadoStaticScraper):
@@ -507,6 +552,19 @@ def _looks_like_text_source(value: str, site: str) -> bool:
         return Path(text.strip().strip('"')).exists()
     except OSError:
         return False
+
+
+def _infer_scraper_site(value: str, site: str) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("qingtian://"):
+        return "qingtian"
+    if text.startswith(("http://ncode.syosetu.com/", "https://ncode.syosetu.com/")):
+        return "syosetu"
+    if text.startswith(("http://kakuyomu.jp/works/", "https://kakuyomu.jp/works/")):
+        return "kakuyomu"
+    if re.match(r"^n[0-9a-z]+$", text):
+        return "syosetu"
+    return site
 
 
 def _novel_from_text_source(value: str, max_chars: int = 0) -> Novel:
@@ -555,6 +613,7 @@ def stage_scrape(
         if limit > 0 and len(novel.full_text) >= limit:
             on_log(f"  WARN text reached scraper_max_chars={limit}; set it to 0 to process the full text")
 
+    site = _infer_scraper_site(url_or_id, site)
     if _looks_like_text_source(url_or_id, site):
         novel = _novel_from_text_source(url_or_id, max_chars=max_chars)
         on_log(f"[1/6] Local text: {novel.title}")
@@ -579,9 +638,9 @@ def stage_scrape(
 
 
 def stage_clean(novel: Novel, on_log: LogFn = _noop, job_dir: Path | None = None) -> list[Segment]:
-    on_log("[2/6] 清洗 + 切片")
+    on_log("[2/6] 整理/洗稿 + 切片")
     text = _strip_story_scaffold(novel.full_text, novel, on_log=on_log, job_dir=job_dir)
-    text = _clean_non_story_text(text, on_log=on_log, job_dir=job_dir)
+    text = _rewrite_story_text(text, on_log=on_log, job_dir=job_dir)
     segs = split_segments(text)
     on_log(f"  OK 切成 {len(segs)} 段")
     if not segs:
@@ -657,74 +716,46 @@ def _strip_story_scaffold(text: str, novel: Novel, on_log: LogFn = _noop, job_di
     return result
 
 
-_NON_STORY_PATTERNS = [
-    r"作者(有话说|的话|ps|PS|留言|声明)",
-    r"^(PS|P\.S\.|ps)[:：]",
-    r"请假|断更|补更|更新通知|更新时间|恢复更新",
-    r"上架(感言|通知|说明)|架感言|首订|订阅|求首订",
-    r"求(月票|推荐票|收藏|追读|打赏|订阅|五星|好评|催更)",
-    r"感谢.*?(打赏|月票|推荐票|盟主|白银|黄金|支持)",
-    r"(月票|推荐票|打赏|催更|收藏|追读).{0,12}(加更|名单|感谢|支持)",
-    r"读者群|书友群|QQ群|q群|V群|微信|公众号",
-    r"免责声明|版权声明|本章说|章节感言|章节说明|作品相关",
-    r"人物(设定|介绍|小传)|角色(设定|介绍)|人设|设定集|资料卡",
-]
-_NON_STORY_RE = re.compile("|".join(f"(?:{p})" for p in _NON_STORY_PATTERNS), re.I)
-
-
-def _clean_non_story_text(text: str, on_log: LogFn = _noop, job_dir: Path | None = None) -> str:
+def _rewrite_story_text(text: str, on_log: LogFn = _noop, job_dir: Path | None = None) -> str:
     source = str(text or "")
-    if not bool(config.get("ai_text_clean_enabled", False)):
+    if not bool(config.get("ai_rewrite_enabled", False)):
         return source
-    paragraphs = _split_clean_paragraphs(source)
+    if not _can_call_text_llm():
+        on_log("  AI 洗稿已开启，但未配置 LLM API Key；已保留原文")
+        return source
+    paragraphs = _split_rewrite_paragraphs(source)
     if not paragraphs:
         return source
 
-    removed: set[int] = set()
-    for i, para in enumerate(paragraphs):
-        if _looks_non_story_paragraph(para):
-            removed.add(i)
-
-    rule_removed = len(removed)
-    ai_removed: set[int] = set()
-    if config.llm_api_key or config.llm_provider == "ollama":
-        try:
-            ai_removed = _ai_classify_non_story_paragraphs(paragraphs, removed, on_log)
-            removed.update(ai_removed)
-        except Exception as exc:
-            on_log(f"  WARN AI 扫文清理失败，保留规则清理结果: {exc}")
-    else:
-        on_log("  AI 扫文清理已开启，但未配置 LLM API Key；仅使用规则清理")
-
-    cleaned_paragraphs = [p for i, p in enumerate(paragraphs) if i not in removed]
-    cleaned = "\n\n".join(cleaned_paragraphs).strip()
-    if not cleaned:
-        on_log("  WARN 扫文清理结果为空，已回退原文")
+    started_chars = len(source)
+    try:
+        rewritten = _ai_rewrite_paragraphs(paragraphs, on_log)
+    except Exception as exc:
+        on_log(f"  WARN AI 洗稿失败，已保留原文: {exc}")
+        return source
+    if not rewritten.strip():
+        on_log("  WARN AI 洗稿结果为空，已保留原文")
         return source
 
     report = {
         "enabled": True,
+        "mode": "rewrite",
         "paragraphs": len(paragraphs),
-        "removed_total": len(removed),
-        "removed_by_rules": rule_removed,
-        "removed_by_ai": len(ai_removed),
-        "removed_indices": sorted(removed)[:1000],
-        "chars_before": len(source),
-        "chars_after": len(cleaned),
+        "chars_before": started_chars,
+        "chars_after": len(rewritten),
+        "batch_chars": int(config.get("ai_rewrite_batch_chars", 3500) or 3500),
+        "prompt_hash": _text_hash(str(config.get("ai_rewrite_prompt", "") or "")),
     }
     if job_dir is not None:
-        _write_json(job_dir / "text_clean_report.json", report)
-        (job_dir / "text_cleaned.txt").write_text(cleaned, encoding="utf-8")
-    on_log(
-        f"  AI扫文清理: 段落 {len(paragraphs)} -> {len(cleaned_paragraphs)}，"
-        f"删除 {len(removed)} 段，字数 {len(source)} -> {len(cleaned)}"
-    )
-    return cleaned
+        _write_json(job_dir / "text_rewrite_report.json", report)
+        (job_dir / "text_rewritten.txt").write_text(rewritten, encoding="utf-8")
+    on_log(f"  AI 洗稿改写完成：段落 {len(paragraphs)}，字数 {started_chars} -> {len(rewritten)}")
+    return rewritten
 
 
-def _split_clean_paragraphs(text: str) -> list[str]:
+def _split_rewrite_paragraphs(text: str) -> list[str]:
     normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    raw = re.split(r"\n\s*\n|(?<=。)\s*(?=作者有话说|作者的话|PS[:：]|ps[:：])", normalized)
+    raw = re.split(r"\n\s*\n", normalized)
     paragraphs = []
     for para in raw:
         para = re.sub(r"[ \t]+\n", "\n", para).strip()
@@ -733,72 +764,60 @@ def _split_clean_paragraphs(text: str) -> list[str]:
     return paragraphs
 
 
-def _looks_non_story_paragraph(text: str) -> bool:
-    compact = re.sub(r"\s+", "", text or "")
-    if not compact:
-        return True
-    if len(compact) > 420:
-        return False
-    if _NON_STORY_RE.search(compact):
-        dialogue_marks = compact.count("“") + compact.count("”") + compact.count('"')
-        story_punc = sum(compact.count(ch) for ch in "。！？")
-        return dialogue_marks <= 2 or story_punc <= 4
-    return False
-
-
-def _ai_classify_non_story_paragraphs(paragraphs: list[str], already_removed: set[int], on_log: LogFn) -> set[int]:
-    batch_chars = max(1200, int(config.get("ai_text_clean_batch_chars", 6000) or 6000))
+def _ai_rewrite_paragraphs(paragraphs: list[str], on_log: LogFn) -> str:
+    batch_chars = max(800, int(config.get("ai_rewrite_batch_chars", 3500) or 3500))
+    max_tokens = max(1200, min(8192, int(batch_chars * 1.6)))
+    route = _llm_route_settings()
     llm = LLMBackend(
-        provider=config.llm_provider,
-        base_url=config.llm_base_url,
-        api_key=config.llm_api_key,
-        model=config.llm_model,
-        system_prompt=str(config.get("ai_text_clean_prompt", "") or ""),
+        provider=route["provider"],
+        base_url=route["base_url"],
+        api_key=route["api_key"],
+        model=route["model"],
+        system_prompt=str(config.get("ai_rewrite_prompt", "") or ""),
         style_suffix="",
+        temperature=0.45,
+        max_tokens=max_tokens,
+        timeout=180.0,
     )
-    removed: set[int] = set()
-    batch: list[tuple[int, str]] = []
+    batches: list[list[str]] = []
+    batch: list[str] = []
     size = 0
-
-    def flush(current: list[tuple[int, str]]) -> None:
-        if not current:
-            return
-        request = "请判断以下编号段落中哪些应删除，只返回 JSON。\n\n" + "\n\n".join(
-            f"[{idx}] {para[:1200]}" for idx, para in current
-        )
-        with external_api_slot(action="ai text clean"):
-            reply = llm.storyboard(request)
-        for idx in _parse_remove_indices(reply):
-            if any(idx == item[0] for item in current):
-                removed.add(idx)
-
-    for idx, para in enumerate(paragraphs):
-        if idx in already_removed:
-            continue
-        projected = size + len(para)
+    for para in paragraphs:
+        projected = size + len(para) + 2
         if batch and projected > batch_chars:
-            flush(batch)
-            on_log(f"  AI扫文批次完成，累计 AI 删除 {len(removed)} 段")
+            batches.append(batch)
             batch = []
             size = 0
-        batch.append((idx, para))
-        size += len(para)
-    flush(batch)
-    return removed
+        batch.append(para)
+        size += len(para) + 2
+    if batch:
+        batches.append(batch)
+
+    rewritten_parts: list[str] = []
+    for index, current in enumerate(batches, start=1):
+        request = (
+            "请洗稿改写以下小说正文。只输出改写后的正文，不要解释，不要标题，不要编号。\n"
+            "段落之间用一个空行分隔。\n\n"
+            + "\n\n".join(current)
+        )
+        with external_api_slot(action="ai rewrite"):
+            reply = llm.storyboard(request)
+        cleaned_reply = _strip_llm_fences(reply)
+        if cleaned_reply:
+            rewritten_parts.append(cleaned_reply)
+        on_log(f"  AI 洗稿批次 {index}/{len(batches)} 完成")
+    return "\n\n".join(part.strip() for part in rewritten_parts if part.strip()).strip()
 
 
-def _parse_remove_indices(reply: str) -> set[int]:
-    text = str(reply or "").strip()
-    match = re.search(r"\{.*\}", text, re.S)
-    if match:
-        try:
-            data = json.loads(match.group(0))
-            raw = data.get("remove", [])
-            return {int(x) for x in raw if str(x).strip().lstrip("-").isdigit() and int(x) >= 0}
-        except Exception:
-            pass
-    nums = re.findall(r"\d+", text)
-    return {int(x) for x in nums}
+def _strip_llm_fences(text: str) -> str:
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", value)
+        value = re.sub(r"\s*```$", "", value)
+    for prefix in ("改写后的正文：", "洗稿后的正文：", "正文："):
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip()
+    return value
 
 
 def _stable_hash(value) -> str:
@@ -853,6 +872,18 @@ def _load_tts_manifest(path: Path) -> dict:
     return data
 
 
+_TTS_CACHE_READY_STATUSES = {"ready"}
+_TTS_RESET_STATUSES = {
+    "failed",
+    "waiting_slot",
+    "running",
+    "invalid_waveform",
+    "fallback_silence",
+    "fallback_stalled",
+    "fallback_manual",
+}
+
+
 def _set_tts_manifest_entry(manifest_path: Path, manifest: dict, entry: dict) -> None:
     segments = manifest.setdefault("segments", [])
     index = int(entry.get("index", -1))
@@ -869,15 +900,18 @@ def _set_tts_manifest_entry(manifest_path: Path, manifest: dict, entry: dict) ->
 
 def _tts_manifest_entry(manifest: dict, index: int) -> dict | None:
     for entry in manifest.get("segments") or []:
-        if int(entry.get("index", -1)) == int(index):
-            return entry
+        try:
+            if int(entry.get("index", -1)) == int(index):
+                return entry
+        except Exception:
+            continue
     return None
 
 
 def _tts_cache_matches(entry: dict | None, expected: dict, out: Path) -> bool:
     if not entry or not out.exists():
         return False
-    if str(entry.get("status")) not in {"ready", "fallback_silence"}:
+    if str(entry.get("status")) not in _TTS_CACHE_READY_STATUSES:
         return False
     for key in ("text_hash", "config_hash", "provider", "voice", "rate"):
         if str(entry.get(key, "")) != str(expected.get(key, "")):
@@ -897,9 +931,28 @@ def _tts_cache_matches(entry: dict | None, expected: dict, out: Path) -> bool:
     return float(entry.get("duration") or 0) > 0.05
 
 
-def _ready_tts_entry(index: int, seg: Segment, out: Path, duration: float, expected: dict, status: str = "ready") -> dict:
-    sig = _file_signature(out)
+def _tts_expected_for_segment(seg: Segment, config_hash: str | None = None) -> dict:
     return {
+        "text_hash": _text_hash(seg.text),
+        "config_hash": config_hash or _tts_config_hash(),
+        "provider": config.tts_provider,
+        "voice": config.tts_voice,
+        "rate": config.tts_rate,
+        "volume": config.get("tts_volume", 1.0),
+    }
+
+
+def _ready_tts_entry(
+    index: int,
+    seg: Segment,
+    out: Path,
+    duration: float,
+    expected: dict,
+    status: str = "ready",
+    waveform: dict | None = None,
+) -> dict:
+    sig = _file_signature(out)
+    entry = {
         "index": index,
         "status": status,
         "path": str(out),
@@ -914,6 +967,366 @@ def _ready_tts_entry(index: int, seg: Segment, out: Path, duration: float, expec
         "file_size": sig.get("size", 0),
         "file_mtime": sig.get("mtime", 0),
     }
+    if waveform:
+        entry["waveform_ok"] = True
+        entry["waveform"] = waveform
+    return entry
+
+
+def _tts_entries_by_index(manifest: dict) -> dict[int, dict]:
+    entries: dict[int, dict] = {}
+    for entry in manifest.get("segments") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            entries[int(entry.get("index", -1))] = entry
+        except Exception:
+            continue
+    return entries
+
+
+def _tts_backend_payload(segment_timeout_seconds: float, text: str, out_path: Path) -> dict:
+    return {
+        "provider": config.tts_provider,
+        "voice": config.tts_voice,
+        "rate": config.tts_rate,
+        "api_key": config.tts_api_key,
+        "base_url": config.tts_base_url,
+        "extra": {
+            **(config.tts_extra or {}),
+            "emotion": config.tts_emotion,
+            "model": config.get("tts_model", "tts-1"),
+            "timeout_seconds": segment_timeout_seconds,
+        },
+        "volume": config.get("tts_volume", 1.0),
+        "text": text,
+        "out_path": str(out_path),
+    }
+
+
+def _synth_tts_subprocess(payload: dict, timeout_seconds: float) -> float:
+    out_path = Path(str(payload["out_path"]))
+    token = f"{os.getpid()}_{threading.get_ident()}_{time.time_ns()}"
+    payload_path = out_path.with_name(f"{out_path.stem}.{token}.payload.json")
+    result_path = out_path.with_name(f"{out_path.stem}.{token}.result.json")
+    _write_json(payload_path, payload)
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(
+        [sys.executable, "-B", "-m", "app.tts_worker", str(payload_path), str(result_path)],
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        env=env,
+        **kwargs,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                proc.kill()
+        stdout, stderr = proc.communicate()
+        result_path.unlink(missing_ok=True)
+        raise TimeoutError(f"TTS subprocess timed out after {timeout_seconds:.0f}s") from exc
+    finally:
+        payload_path.unlink(missing_ok=True)
+
+    result = _read_json(result_path, {})
+    result_path.unlink(missing_ok=True)
+    if proc.returncode != 0 or not result.get("ok"):
+        detail = str(result.get("error") or stderr or stdout or f"exit {proc.returncode}").strip()
+        raise RuntimeError(detail[:1200])
+    return float(result.get("duration") or 0.0)
+
+
+def _synth_tts_segment(tts: TTSBackend, text: str, out_path: Path, segment_timeout_seconds: float) -> float:
+    if bool(config.get("tts_subprocess_isolation", True)):
+        payload = _tts_backend_payload(segment_timeout_seconds, text, out_path)
+        return _synth_tts_subprocess(payload, segment_timeout_seconds + 15.0)
+    return tts.synth(text, out_path)
+
+
+def _audio_waveform_stats(path: Path, duration: float) -> dict:
+    timeout = max(30.0, min(180.0, float(duration or 0) + 30.0))
+    try:
+        with ffmpeg_slot(action="tts waveform check"):
+            proc = subprocess.run(
+                [
+                    ffmpeg_path(),
+                    "-hide_banner",
+                    "-nostdin",
+                    "-i",
+                    str(path),
+                    "-af",
+                    "silencedetect=noise=-50dB:d=0.30,astats=metadata=1:reset=0",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=timeout,
+            )
+    except Exception as exc:
+        raise RuntimeError(f"waveform probe failed: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()[-1:] or [f"ffmpeg exit {proc.returncode}"]
+        raise RuntimeError(f"waveform probe failed: {detail[0]}")
+
+    stderr = proc.stderr or ""
+    rms_values: list[float] = []
+    peak_values: list[float] = []
+    for value in re.findall(r"RMS level dB:\s*([-+]?inf|[-+]?\d+(?:\.\d+)?)", stderr, flags=re.I):
+        if value.lower().endswith("inf"):
+            continue
+        try:
+            rms_values.append(float(value))
+        except Exception:
+            pass
+    for value in re.findall(r"Peak level dB:\s*([-+]?inf|[-+]?\d+(?:\.\d+)?)", stderr, flags=re.I):
+        if value.lower().endswith("inf"):
+            continue
+        try:
+            peak_values.append(float(value))
+        except Exception:
+            pass
+    silence_total = 0.0
+    for value in re.findall(r"silence_duration:\s*([0-9]+(?:\.[0-9]+)?)", stderr):
+        try:
+            silence_total += float(value)
+        except Exception:
+            pass
+    silence_ratio = min(1.0, max(0.0, silence_total / max(0.001, float(duration or 0))))
+    return {
+        "rms_db": round(max(rms_values), 3) if rms_values else None,
+        "peak_db": round(max(peak_values), 3) if peak_values else None,
+        "silence_ratio": round(silence_ratio, 4),
+        "silence_seconds": round(silence_total, 3),
+    }
+
+
+def _validate_tts_audio(path: Path) -> tuple[float, dict]:
+    duration = _audio_duration(path)
+    if duration <= 0.05:
+        raise RuntimeError("audio duration is zero")
+    sig = _file_signature(path)
+    if int(sig.get("size") or 0) < 512:
+        raise RuntimeError("audio file is too small")
+    if not bool(config.get("tts_waveform_validation", True)):
+        return duration, {}
+
+    stats = _audio_waveform_stats(path, duration)
+    rms_db = stats.get("rms_db")
+    peak_db = stats.get("peak_db")
+    silence_ratio = float(stats.get("silence_ratio") or 0.0)
+    try:
+        min_rms_db = float(config.get("tts_waveform_min_rms_db", -55.0))
+    except Exception:
+        min_rms_db = -55.0
+    try:
+        max_silence_ratio = float(config.get("tts_waveform_max_silence_ratio", 0.92))
+    except Exception:
+        max_silence_ratio = 0.92
+    max_silence_ratio = max(0.5, min(0.99, max_silence_ratio))
+
+    if rms_db is None or peak_db is None:
+        raise RuntimeError("waveform has no measurable signal")
+    if float(rms_db) < min_rms_db:
+        raise RuntimeError(f"waveform too quiet: rms={float(rms_db):.1f}dB < {min_rms_db:.1f}dB")
+    if silence_ratio > max_silence_ratio:
+        raise RuntimeError(f"waveform mostly silent: {silence_ratio:.0%} > {max_silence_ratio:.0%}")
+    return duration, stats
+
+
+def _load_job_segments(job_dir: Path) -> list[Segment]:
+    rows = _read_json(job_dir / "segments.json", [])
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("还没有 segments.json，请先让任务跑过整理/切片阶段。")
+    segments: list[Segment] = []
+    for pos, row in enumerate(rows):
+        if isinstance(row, dict):
+            raw_index = row.get("i", row.get("index", pos))
+            text = str(row.get("text") or "")
+        else:
+            raw_index = pos
+            text = str(row or "")
+        if not text.strip():
+            continue
+        try:
+            index = int(raw_index)
+        except Exception:
+            index = pos
+        segments.append(Segment(index=index, text=text))
+    if not segments:
+        raise RuntimeError("segments.json 中没有可用文本段。")
+    return segments
+
+
+def _safe_unlink_under(root: Path, value) -> None:
+    if not value:
+        return
+    try:
+        candidate = Path(str(value))
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve()
+        root_resolved = root.resolve()
+        if resolved == root_resolved or root_resolved not in resolved.parents:
+            return
+        resolved.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _clear_downstream_after_tts_change(job_dir: Path) -> None:
+    for name in ("_clips", "_prefetch_images"):
+        target = job_dir / name
+        if target.exists():
+            shutil.rmtree(target)
+    for name in (
+        "durations.json",
+        "plans.json",
+        "plans_prefetch.json",
+        "compose_manifest.json",
+        "final.mp4",
+        "final.tmp.mp4",
+        "audio_full.mp3",
+        "subtitle.ass",
+        "subtitle.srt",
+        "result.json",
+        "upload_result.json",
+    ):
+        (job_dir / name).unlink(missing_ok=True)
+
+
+def _refresh_tts_manifest_header(manifest: dict, total: int) -> None:
+    manifest.update(
+        {
+            "provider": config.tts_provider,
+            "voice": config.tts_voice,
+            "rate": config.tts_rate,
+            "volume": config.get("tts_volume", 1.0),
+            "config_hash": _tts_config_hash(),
+            "total": total,
+        }
+    )
+
+
+def reset_tts_segments(job_id: str, indices: Iterable[int] | None = None) -> dict:
+    """Remove selected bad TTS segment cache so the next resume resynthesizes it."""
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再重试 TTS 段。")
+    job_dir = _safe_job_path(job_id)
+    segments = _load_job_segments(job_dir)
+    selected = {int(i) for i in indices} if indices is not None else None
+    audio_dir = job_dir / "audio"
+    manifest_path = audio_dir / "tts_manifest.json"
+    manifest = _load_tts_manifest(manifest_path)
+    entries = _tts_entries_by_index(manifest)
+    changed: list[int] = []
+    keep_entries = []
+    remove_indexes: set[int] = set()
+
+    for i, _seg in enumerate(segments):
+        entry = entries.get(i)
+        status = str(entry.get("status") or "") if entry else ""
+        should_reset = i in selected if selected is not None else status in _TTS_RESET_STATUSES
+        if not should_reset:
+            continue
+        remove_indexes.add(i)
+        changed.append(i)
+        out = audio_dir / f"seg_{i:05d}.mp3"
+        out.unlink(missing_ok=True)
+        out.with_suffix(".tmp.mp3").unlink(missing_ok=True)
+        if entry:
+            _safe_unlink_under(job_dir, entry.get("path"))
+
+    for entry in manifest.get("segments") or []:
+        try:
+            index = int(entry.get("index", -1))
+        except Exception:
+            index = -1
+        if index not in remove_indexes:
+            keep_entries.append(entry)
+    manifest["segments"] = keep_entries
+    _refresh_tts_manifest_header(manifest, len(segments))
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(manifest_path, manifest)
+
+    if changed:
+        _clear_downstream_after_tts_change(job_dir)
+        write_status(job_dir, stage="queued", progress=0.15, worker_pid=None, error="", video="", youtube_url="")
+        append_log(job_dir, f"TTS reset segments {changed}; restart selected job to synthesize them again")
+    return {"job_id": job_id, "changed": len(changed), "segments": changed}
+
+
+def reset_tts_unfinished_segments(job_id: str) -> dict:
+    """Remove unfinished/failed/invalid TTS segments so the next resume retries real audio."""
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再执行 TTS 重试。")
+    job_dir = _safe_job_path(job_id)
+    segments = _load_job_segments(job_dir)
+    audio_dir = job_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = audio_dir / "tts_manifest.json"
+    manifest = _load_tts_manifest(manifest_path)
+    _refresh_tts_manifest_header(manifest, len(segments))
+    entries = _tts_entries_by_index(manifest)
+    changed: list[int] = []
+    keep_entries = []
+    remove_indexes: set[int] = set()
+
+    for i, _seg in enumerate(segments):
+        out = audio_dir / f"seg_{i:05d}.mp3"
+        entry = entries.get(i)
+        status = str(entry.get("status") or "missing") if entry else "missing"
+        if entry and status not in _TTS_RESET_STATUSES:
+            try:
+                _validate_tts_audio(out)
+                continue
+            except Exception:
+                status = "invalid_waveform"
+        if not entry and not out.exists():
+            continue
+        remove_indexes.add(i)
+        changed.append(i)
+        out.unlink(missing_ok=True)
+        out.with_suffix(".tmp.mp3").unlink(missing_ok=True)
+        if entry:
+            _safe_unlink_under(job_dir, entry.get("path"))
+
+    for entry in manifest.get("segments") or []:
+        try:
+            index = int(entry.get("index", -1))
+        except Exception:
+            index = -1
+        if index not in remove_indexes:
+            keep_entries.append(entry)
+    manifest["segments"] = keep_entries
+    _write_json(manifest_path, manifest)
+
+    if changed:
+        _clear_downstream_after_tts_change(job_dir)
+        write_status(job_dir, stage="queued", progress=0.15, worker_pid=None, error="", video="", youtube_url="")
+        append_log(job_dir, f"TTS unfinished/bad segments reset {changed}; restart selected job to retry real audio")
+    return {"job_id": job_id, "changed": len(changed), "segments": changed}
 
 
 def _stage_tts_manifest_impl(
@@ -924,9 +1337,13 @@ def _stage_tts_manifest_impl(
 ) -> tuple[list[Path], list[float]]:
     workers = _parallel_limit("max_parallel_tts", 2, len(segments), hard_cap=12)
     segment_timeout_seconds = _bounded_timeout(config.get("tts_segment_timeout_seconds", 180), 180.0)
+    stall_retry_seconds = _optional_timeout(config.get("tts_stall_fallback_seconds", 240), 240.0, minimum=5.0)
+    retry_until_success = bool(config.get("tts_retry_until_success", True))
     on_log(
         f"[3/6] TTS provider={config.tts_provider} voice={config.tts_voice} "
-        f"volume={config.get('tts_volume', 1.0)} parallel={workers} timeout={segment_timeout_seconds:.0f}s"
+        f"volume={config.get('tts_volume', 1.0)} parallel={workers} "
+        f"timeout={segment_timeout_seconds:.0f}s stall_retry_log={stall_retry_seconds:.0f}s "
+        f"retry_until_success={'on' if retry_until_success else 'off'} waveform_check={'on' if config.get('tts_waveform_validation', True) else 'off'}"
     )
 
     def make_tts() -> TTSBackend:
@@ -950,22 +1367,16 @@ def _stage_tts_manifest_impl(
     manifest_path = audio_dir / "tts_manifest.json"
     manifest = _load_tts_manifest(manifest_path)
     manifest_lock = threading.Lock()
-    manifest.update(
-        {
-            "provider": config.tts_provider,
-            "voice": config.tts_voice,
-            "rate": config.tts_rate,
-            "volume": config.get("tts_volume", 1.0),
-            "config_hash": _tts_config_hash(),
-            "total": len(segments),
-            "parallel": workers,
-        }
-    )
+    _refresh_tts_manifest_header(manifest, len(segments))
+    manifest["parallel"] = workers
     _write_json(manifest_path, manifest)
 
     audios: list[Path | None] = [None] * len(segments)
     durations: list[float] = [0.0] * len(segments)
-    retries = max(1, int(config.tts_retries))
+    try:
+        retries = max(1, int(config.get("tts_retries", 3) or 3))
+    except Exception:
+        retries = 3
     try:
         heartbeat_seconds = float(config.get("tts_heartbeat_seconds", 30) or 30)
     except Exception:
@@ -973,6 +1384,7 @@ def _stage_tts_manifest_impl(
     heartbeat_seconds = max(10.0, min(300.0, heartbeat_seconds))
     running_lock = threading.Lock()
     running_segments: dict[int, dict[str, float | int]] = {}
+    stall_warned: set[int] = set()
 
     def set_manifest(entry: dict) -> None:
         with manifest_lock:
@@ -1001,27 +1413,52 @@ def _stage_tts_manifest_impl(
 
     def process_segment(i: int, seg: Segment) -> tuple[int, Path, float]:
         out = audio_dir / f"seg_{i:05d}.mp3"
-        expected = {
-            "text_hash": _text_hash(seg.text),
-            "config_hash": manifest["config_hash"],
-            "provider": config.tts_provider,
-            "voice": config.tts_voice,
-            "rate": config.tts_rate,
-            "volume": config.get("tts_volume", 1.0),
-        }
+        expected = _tts_expected_for_segment(seg, str(manifest["config_hash"]))
         with manifest_lock:
             entry = _tts_manifest_entry(manifest, i)
         d = 0.0
+        waveform: dict = {}
         if _tts_cache_matches(entry, expected, out):
-            d = float(entry.get("duration") or 0.0)
+            try:
+                d, waveform = _validate_tts_audio(out)
+                set_manifest(_ready_tts_entry(i, seg, out, d, expected, waveform=waveform))
+            except Exception as exc:
+                out.unlink(missing_ok=True)
+                set_manifest(
+                    {
+                        **expected,
+                        "index": i,
+                        "status": "invalid_waveform",
+                        "path": str(out),
+                        "error": str(exc),
+                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                )
+                on_log(f"  WARN seg{i} cached TTS invalid, retrying: {exc}")
+                d = 0.0
         elif out.exists():
-            d = _audio_duration(out)
-            if d > 0.05:
-                set_manifest(_ready_tts_entry(i, seg, out, d, expected))
+            try:
+                d, waveform = _validate_tts_audio(out)
+                set_manifest(_ready_tts_entry(i, seg, out, d, expected, waveform=waveform))
+            except Exception as exc:
+                out.unlink(missing_ok=True)
+                set_manifest(
+                    {
+                        **expected,
+                        "index": i,
+                        "status": "invalid_waveform",
+                        "path": str(out),
+                        "error": str(exc),
+                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                )
+                on_log(f"  WARN seg{i} existing TTS invalid, retrying: {exc}")
+                d = 0.0
 
         if d <= 0.05:
             tts = make_tts()
-            for attempt in range(1, retries + 1):
+            attempt = 1
+            while True:
                 tmp = out.with_suffix(".tmp.mp3")
                 tmp.unlink(missing_ok=True)
                 try:
@@ -1051,11 +1488,10 @@ def _stage_tts_manifest_impl(
                                 },
                             )
                             mark_running(i, attempt)
-                            d = tts.synth(seg.text, tmp)
-                        if d <= 0.05:
-                            raise RuntimeError("audio duration is zero")
+                            d = _synth_tts_segment(tts, seg.text, tmp, segment_timeout_seconds)
+                        d, waveform = _validate_tts_audio(tmp)
                         tmp.replace(out)
-                        set_manifest(_ready_tts_entry(i, seg, out, d, expected))
+                        set_manifest(_ready_tts_entry(i, seg, out, d, expected, waveform=waveform))
                         break
                     finally:
                         clear_running(i)
@@ -1065,44 +1501,88 @@ def _stage_tts_manifest_impl(
                         {
                             **expected,
                             "index": i,
-                            "status": "failed",
+                            "status": "invalid_waveform" if "waveform" in str(exc).lower() or "silent" in str(exc).lower() or "quiet" in str(exc).lower() else "failed",
                             "path": str(out),
                             "attempt": attempt,
                             "error": str(exc),
                             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                         },
                     )
-                    on_log(f"  WARN seg{i} TTS failed {attempt}/{retries}: {exc}")
-                    if attempt < retries:
-                        on_log(f"    TTS seg{i} retrying ({attempt + 1}/{retries})...")
-                        time.sleep(min(8, attempt * 1.5))
-            if d <= 0.05 and config.tts_fail_silence:
-                d = _estimated_speech_duration(seg.text)
-                _create_silence(out, d)
-                set_manifest(_ready_tts_entry(i, seg, out, d, expected, status="fallback_silence"))
-                on_log(f"  WARN seg{i} used {d:.1f}s silent placeholder")
-            elif d <= 0.05:
-                raise RuntimeError(f"seg{i} TTS failed after retries")
+                    limit_label = "until success" if retry_until_success else f"{attempt}/{retries}"
+                    on_log(f"  WARN seg{i} TTS failed {limit_label}: {exc}")
+                    if not retry_until_success and attempt >= retries:
+                        raise RuntimeError(f"seg{i} TTS failed after {retries} attempts") from exc
+                    attempt += 1
+                    delay = min(60.0, max(2.0, (attempt - 1) * 2.0))
+                    on_log(f"    TTS seg{i} retrying real audio after {delay:.0f}s (attempt {attempt})...")
+                    time.sleep(delay)
 
         return i, out, d
 
     completed = 0
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tts") as pool:
-        pending = {pool.submit(process_segment, i, seg) for i, seg in enumerate(segments)}
+    completed_indexes: set[int] = set()
+
+    def record_completed(i: int, out: Path, d: float) -> None:
+        nonlocal completed
+        if i in completed_indexes:
+            return
+        audios[i] = out
+        durations[i] = d
+        completed_indexes.add(i)
+        completed += 1
+        _write_json(job_dir / "durations.json", durations)
+        on_log(f"  TTS progress {completed}/{len(segments)}: seg{i} {d:.1f}s, total {sum(durations):.1f}s")
+        on_prog(completed / max(1, len(segments)))
+
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tts")
+    future_segments = {pool.submit(process_segment, i, seg): (i, seg) for i, seg in enumerate(segments)}
+    pending = set(future_segments)
+    last_heartbeat = 0.0
+
+    def stalled_futures() -> list[tuple[object, int, Segment, float]]:
+        if stall_retry_seconds <= 0:
+            return []
+        now = time.monotonic()
+        with running_lock:
+            snapshot = dict(running_segments)
+        stalled = []
+        for future in list(pending):
+            i, seg = future_segments[future]
+            info = snapshot.get(i)
+            if not info:
+                continue
+            elapsed = max(0.0, now - float(info.get("started") or now))
+            if elapsed >= stall_retry_seconds:
+                stalled.append((future, i, seg, elapsed))
+        return stalled
+
+    try:
         while pending:
-            done, pending = wait(pending, timeout=heartbeat_seconds, return_when=FIRST_COMPLETED)
+            monitor_timeout = heartbeat_seconds
+            if stall_retry_seconds > 0:
+                monitor_timeout = min(heartbeat_seconds, max(1.0, stall_retry_seconds / 4.0))
+            done, pending = wait(pending, timeout=monitor_timeout, return_when=FIRST_COMPLETED)
             if not done:
-                on_log(f"  TTS still running: {running_summary()} ({completed}/{len(segments)} done)")
+                stalled = stalled_futures()
+                for _future, i, _seg, elapsed in stalled:
+                    if i not in stall_warned:
+                        stall_warned.add(i)
+                        on_log(
+                            f"  WARN seg{i} still running {elapsed:.0f}s; subprocess timeout will kill and retry, "
+                            "no silent placeholder will be generated"
+                        )
+                now = time.monotonic()
+                if now - last_heartbeat >= heartbeat_seconds:
+                    last_heartbeat = now
+                    on_log(f"  TTS still running: {running_summary()} ({completed}/{len(segments)} done)")
                 on_prog(completed / max(1, len(segments)))
                 continue
             for future in done:
                 i, out, d = future.result()
-                audios[i] = out
-                durations[i] = d
-                completed += 1
-                _write_json(job_dir / "durations.json", durations)
-                on_log(f"  TTS progress {completed}/{len(segments)}: seg{i} {d:.1f}s, total {sum(durations):.1f}s")
-                on_prog(completed / max(1, len(segments)))
+                if i not in completed_indexes:
+                    record_completed(i, out, d)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     final_audios = [p for p in audios if p is not None]
     if len(final_audios) != len(segments):
@@ -1118,55 +1598,6 @@ def stage_tts(
     on_prog: ProgFn = _noop,
 ) -> tuple[list[Path], list[float]]:
     return _stage_tts_manifest_impl(segments, job_dir, on_log, on_prog)
-    on_log(f"[3/6] TTS: provider={config.tts_provider} voice={config.tts_voice}")
-    tts = TTSBackend(
-        provider=config.tts_provider,
-        voice=config.tts_voice,
-        rate=config.tts_rate,
-        api_key=config.tts_api_key,
-        base_url=config.tts_base_url,
-        extra=config.tts_extra,
-        volume=config.get("tts_volume", 1.0),
-    )
-    audio_dir = job_dir / "audio"
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    audios: list[Path] = []
-    durations: list[float] = []
-    retries = max(1, int(config.tts_retries))
-
-    for i, seg in enumerate(segments):
-        out = audio_dir / f"seg_{i:05d}.mp3"
-        d = _audio_duration(out) if out.exists() else 0.0
-        if d <= 0.05:
-            for attempt in range(1, retries + 1):
-                tmp = out.with_suffix(".tmp.mp3")
-                tmp.unlink(missing_ok=True)
-                try:
-                    d = tts.synth(seg.text, tmp)
-                    if d <= 0.05:
-                        raise RuntimeError("音频时长为 0")
-                    tmp.replace(out)
-                    break
-                except Exception as exc:
-                    tmp.unlink(missing_ok=True)
-                    on_log(f"  WARN seg{i} TTS 失败 {attempt}/{retries}: {exc}")
-                    if attempt < retries:
-                        time.sleep(min(8, attempt * 1.5))
-            if d <= 0.05 and config.tts_fail_silence:
-                d = _estimated_speech_duration(seg.text)
-                _create_silence(out, d)
-                on_log(f"  WARN seg{i} 已用 {d:.1f}s 静音占位，字幕时间轴保持连续")
-            elif d <= 0.05:
-                raise RuntimeError(f"seg{i} TTS 多次失败")
-
-        audios.append(out)
-        durations.append(d)
-        if (i + 1) % 5 == 0 or i == len(segments) - 1:
-            _write_json(job_dir / "durations.json", durations)
-            on_log(f"  [{i + 1}/{len(segments)}] 累计 {sum(durations):.1f}s")
-            on_prog((i + 1) / max(1, len(segments)))
-    on_log(f"  OK {len(audios)} 段音频，总时长 {sum(durations):.1f}s")
-    return audios, durations
 
 
 def stage_pacing(
@@ -1194,7 +1625,7 @@ def stage_character_analysis(
     job_dir: Path,
     on_log: LogFn = _noop,
 ) -> dict | None:
-    if not bool(config.get("character_analysis_enabled", False)):
+    if not bool(config.get("character_analysis_enabled", True)):
         return None
     out = job_dir / "character_profiles.json"
     if out.exists():
@@ -1206,7 +1637,8 @@ def stage_character_analysis(
         except Exception:
             pass
 
-    if not can_call_analysis_llm(config.llm_provider, config.llm_api_key):
+    llm_route = _llm_route_settings()
+    if not can_call_analysis_llm(llm_route["provider"], llm_route["api_key"]):
         payload = {"enabled": False, "reason": "LLM API key is empty and provider is not ollama/custom"}
         _write_json(out, payload)
         on_log("  WARN character analysis skipped: no usable LLM credentials")
@@ -1214,10 +1646,10 @@ def stage_character_analysis(
 
     on_log("[4/6] character analysis: extracting protagonists, supporting roles, and visual locks")
     llm = LLMBackend(
-        provider=config.llm_provider,
-        base_url=config.llm_base_url,
-        api_key=config.llm_api_key,
-        model=config.llm_model,
+        provider=llm_route["provider"],
+        base_url=llm_route["base_url"],
+        api_key=llm_route["api_key"],
+        model=llm_route["model"],
         system_prompt=config.llm_storyboard_prompt,
         style_suffix="",
     )
@@ -1244,49 +1676,78 @@ def stage_character_analysis(
 
 def _image_route_settings(role: str) -> dict:
     role = str(role or "scene")
+
+    def workflow_for(provider: str, value: str) -> str:
+        return str(value or "") if str(provider or "").strip().lower() == "comfyui" else ""
+
     if role == "scene":
+        provider = str(config.image_provider or "placeholder")
+        base_url, api_key, model = _apply_unified_image_api(
+            provider,
+            str(config.image_base_url or ""),
+            str(config.image_api_key or ""),
+            str(config.image_model or ""),
+        )
         return {
-            "provider": str(config.image_provider or "placeholder"),
-            "base_url": str(config.image_base_url or ""),
-            "api_key": str(config.image_api_key or ""),
-            "model": str(config.image_model or ""),
-            "workflow_path": str(config.image_workflow or ""),
+            "provider": provider,
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+            "workflow_path": workflow_for(provider, str(config.image_workflow or "")),
         }
 
     if role == "cover":
         provider = str(config.get("cover_provider", "same_as_image") or "").strip()
         if provider in {"", "same_as_image", "同配图", "同图片"}:
             return _image_route_settings("scene")
+        base_url, api_key, model = _apply_unified_image_api(
+            provider,
+            str(config.get("cover_base_url", "") or config.image_base_url or ""),
+            str(config.get("cover_api_key", "") or config.image_api_key or ""),
+            str(config.get("cover_model", "") or config.image_model or ""),
+        )
         return {
             "provider": provider,
-            "base_url": str(config.get("cover_base_url", "") or config.image_base_url or ""),
-            "api_key": str(config.get("cover_api_key", "") or config.image_api_key or ""),
-            "model": str(config.get("cover_model", "") or config.image_model or ""),
-            "workflow_path": str(config.image_workflow or ""),
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+            "workflow_path": workflow_for(provider, str(config.image_workflow or "")),
         }
 
     if role == "character_reference":
         provider = str(config.get("character_reference_provider", "same_as_image") or "").strip()
         if provider in {"", "same_as_image", "同配图", "同图片"}:
             return _image_route_settings("scene")
+        base_url, api_key, model = _apply_unified_image_api(
+            provider,
+            str(config.get("character_reference_base_url", "") or config.image_base_url or ""),
+            str(config.get("character_reference_api_key", "") or config.image_api_key or ""),
+            str(config.get("character_reference_model", "") or config.image_model or ""),
+        )
         return {
             "provider": provider,
-            "base_url": str(config.get("character_reference_base_url", "") or config.image_base_url or ""),
-            "api_key": str(config.get("character_reference_api_key", "") or config.image_api_key or ""),
-            "model": str(config.get("character_reference_model", "") or config.image_model or ""),
-            "workflow_path": str(config.get("character_reference_workflow", "") or config.image_workflow or ""),
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+            "workflow_path": workflow_for(provider, str(config.get("character_reference_workflow", "") or config.image_workflow or "")),
         }
 
     if role == "scene_reference":
         provider = str(config.get("scene_reference_provider", "same_as_image") or "").strip()
         if provider in {"", "same_as_image", "同配图", "同图片"}:
             return _image_route_settings("scene")
+        base_url, api_key, model = _apply_unified_image_api(
+            provider,
+            str(config.get("scene_reference_base_url", "") or config.image_base_url or ""),
+            str(config.get("scene_reference_api_key", "") or config.image_api_key or ""),
+            str(config.get("scene_reference_model", "") or config.image_model or ""),
+        )
         return {
             "provider": provider,
-            "base_url": str(config.get("scene_reference_base_url", "") or config.image_base_url or ""),
-            "api_key": str(config.get("scene_reference_api_key", "") or config.image_api_key or ""),
-            "model": str(config.get("scene_reference_model", "") or config.image_model or ""),
-            "workflow_path": str(config.get("scene_reference_workflow", "") or config.image_workflow or ""),
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+            "workflow_path": workflow_for(provider, str(config.get("scene_reference_workflow", "") or config.image_workflow or "")),
         }
 
     return _image_route_settings("scene")
@@ -1303,6 +1764,11 @@ def _make_image_backend(route: dict, *, provider: str | None = None) -> ImageBac
         workflow_path=route.get("workflow_path", ""),
         timeout_seconds=config.get("image_api_timeout_seconds", 300),
     )
+
+
+def _safe_artifact_name(value: str, fallback: str = "artifact") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._-")
+    return (cleaned or fallback)[:80]
 
 
 def _reference_images_for_text(analysis: dict | None, text: str, *, max_count: int = 2) -> list[Path]:
@@ -1416,7 +1882,7 @@ _POLICY_REPLACEMENTS = [
 ]
 
 
-def _policy_safe_image_prompt(prompt: str, *, fallback_text: str = "") -> str:
+def _policy_safe_image_prompt(prompt: str, *, fallback_text: str = "", allow_title_text: bool = False) -> str:
     value = " ".join(str(prompt or fallback_text or "").split()).strip()
     if not value:
         value = "Cinematic anime illustration of a tense emotional novel scene, expressive faces, soft lighting"
@@ -1424,10 +1890,17 @@ def _policy_safe_image_prompt(prompt: str, *, fallback_text: str = "") -> str:
         value = re.sub(pattern, replacement, value, flags=re.I)
     value = re.sub(r"(?i)\b(blood|gore|corpse|nude|naked|sexual|erotic|severed)\b", "", value)
     value = re.sub(r"\s{2,}", " ", value).strip(" ,.;")
-    guard = (
-        "Family-friendly cinematic anime illustration, adult-looking characters, symbolic emotional drama, "
-        "fully clothed characters, clean composition, soft lighting, readable faces, text-free artwork"
-    )
+    if allow_title_text:
+        guard = (
+            "Family-friendly cinematic cover illustration, adult-looking characters, symbolic emotional drama, "
+            "fully clothed characters, clean composition, soft lighting, readable faces, only the requested title text, "
+            "no extra captions, logos, UI, or watermarks"
+        )
+    else:
+        guard = (
+            "Family-friendly cinematic anime illustration, adult-looking characters, symbolic emotional drama, "
+            "fully clothed characters, clean composition, soft lighting, readable faces, text-free artwork"
+        )
     if "family-friendly" not in value.lower():
         value = f"{value}. {guard}"
     return value[:1400]
@@ -1465,17 +1938,18 @@ def stage_storyboard_and_image(
     image_timeout_seconds = _bounded_timeout(config.get("image_api_timeout_seconds", 300), 300.0)
     scene_route = _image_route_settings("scene")
     scene_reference_route = _image_route_settings("scene_reference")
+    llm_route = _llm_route_settings()
     on_log(
-        f"[5/6] 分镜+出图: llm={config.llm_provider} image={scene_route['provider']} "
+        f"[5/6] 分镜+出图: llm={llm_route['provider']} image={scene_route['provider']} "
         f"parallel={workers} timeout={image_timeout_seconds:.0f}s"
     )
 
     def make_llm() -> LLMBackend:
         return LLMBackend(
-            provider=config.llm_provider,
-            base_url=config.llm_base_url,
-            api_key=config.llm_api_key,
-            model=config.llm_model,
+            provider=llm_route["provider"],
+            base_url=llm_route["base_url"],
+            api_key=llm_route["api_key"],
+            model=llm_route["model"],
             system_prompt=config.llm_storyboard_prompt,
             style_suffix=config.llm_image_style_suffix,
         )
@@ -1682,13 +2156,14 @@ def stage_metadata(novel: Novel, job_dir: Path, on_log: LogFn = _noop) -> dict:
     max_chars = max(min_chars, int(config.get("short_title_max_chars", 30) or 30))
     short_title = ""
     if bool(config.get("short_title_enabled", True)):
-        if config.llm_api_key or config.llm_provider == "ollama":
+        if _can_call_text_llm():
             try:
+                route = _llm_route_settings()
                 llm = LLMBackend(
-                    provider=config.llm_provider,
-                    base_url=config.llm_base_url,
-                    api_key=config.llm_api_key,
-                    model=config.llm_model,
+                    provider=route["provider"],
+                    base_url=route["base_url"],
+                    api_key=route["api_key"],
+                    model=route["model"],
                     system_prompt=str(config.get("short_title_prompt", "") or ""),
                     style_suffix="",
                 )
@@ -1813,7 +2288,10 @@ def _ensure_upload_dependencies(on_log: LogFn = _noop) -> None:
 
 
 def _cover_provider() -> str:
-    return _image_route_settings("cover")["provider"]
+    provider = str(config.get("cover_provider", "same_as_image") or "").strip()
+    if provider in {"", "same_as_image", "同配图", "同图片"}:
+        return str(config.image_provider or "placeholder")
+    return provider
 
 
 def _cover_backend_settings() -> dict:
@@ -1830,51 +2308,65 @@ def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _
     title = _clean_display_title(novel.title)
     excerpt = _cover_excerpt(novel, segments)
     style = str(config.llm_image_style_suffix or "").strip()
-    fallback_template = str(config.get("cover_prompt_template", "") or "")
-    try:
-        fallback = fallback_template.format(title=title, excerpt=excerpt, style=style)
-    except Exception:
-        fallback = (
+    custom = str(config.get("cover_custom_prompt", "") or "").strip()
+    template = str(config.get("cover_prompt_template", "") or "")
+    context = {"title": title, "excerpt": excerpt, "style": style, "custom": custom}
+    fallback = _format_template(
+        template,
+        context,
+        fallback=(
             f'Create a cinematic YouTube cover illustration for a novel video. '
-            f'Exact story title context: "{title}". Story excerpt: {excerpt}. '
-            f'Do not render text in the artwork. Leave natural uncluttered lower space for title overlay. {style}'
-        )
+            f'Render the exact title text "{title}" as the main large readable cover title inside the image. '
+            f'Story excerpt: {excerpt}. {custom} {style}'
+        ),
+    )
 
-    if config.llm_api_key or config.llm_provider == "ollama":
+    if _can_call_text_llm():
         try:
-            cover_system = (
-                "You write one concise English image-generation prompt for a long-form novel recap cover. "
-                "Use the title as fixed story context. Do not ask the image model to render any title, words, "
-                "logos, captions, UI, or watermarks. Keep the scene policy-safe: no gore, blood, corpse, "
-                "nudity, sexual content, weapon close-ups, or explicit violence. Ask for clean uncluttered visual space at the bottom where "
-                "the video editor will overlay the exact title."
-            )
+            route = _llm_route_settings()
             llm = LLMBackend(
-                provider=config.llm_provider,
-                base_url=config.llm_base_url,
-                api_key=config.llm_api_key,
-                model=config.llm_model,
-                system_prompt=cover_system,
-                style_suffix=style,
+                provider=route["provider"],
+                base_url=route["base_url"],
+                api_key=route["api_key"],
+                model=route["model"],
+                system_prompt=str(config.get("cover_ai_analysis_prompt", "") or ""),
+                style_suffix="",
             )
             request = (
-                f'Exact title: "{title}"\n'
-                f"Excerpt: {excerpt}\n\n"
-                "Return one prompt only. The prompt must be based on the excerpt and must keep the exact title "
-                "as story context, but the artwork itself must contain no readable text."
+                f"{fallback}\n\n"
+                "Return one prompt only. The prompt must explicitly instruct the image model to render the "
+                f'exact title text "{title}" inside the cover image as polished large readable typography. Do not request '
+                "any post-production/editor overlay."
             )
             with external_api_slot(action="cover prompt"):
                 prompt = llm.storyboard(request).strip()
             if title not in prompt:
                 prompt = f'Title context: "{title}". {prompt}'
             return _policy_safe_image_prompt(
-                f'{prompt}. Do not render any words or title text in the image; '
-                f'leave a natural uncluttered lower area for the overlaid title "{title}".',
+                f'{prompt}. Render the exact title text "{title}" as the main readable cover title in the image. '
+                f'Do not add other text, logos, captions, UI, or watermarks.',
                 fallback_text=excerpt,
+                allow_title_text=True,
             )
         except Exception as exc:
             on_log(f"  WARN cover prompt LLM failed: {exc}; use template prompt")
-    return _policy_safe_image_prompt(fallback, fallback_text=excerpt)
+    if title not in fallback:
+        fallback = f'Render the exact title text "{title}" as the main readable cover title. {fallback}'
+    return _policy_safe_image_prompt(fallback, fallback_text=excerpt, allow_title_text=True)
+
+
+def _cover_negative_prompt() -> str:
+    negative = str(config.llm_negative_prompt or "")
+    filtered = []
+    for part in negative.split(","):
+        item = part.strip()
+        lower = item.lower()
+        if lower in {"text", "texts", "word", "words", "caption", "captions"}:
+            continue
+        if "title text" in lower or "readable text" in lower:
+            continue
+        filtered.append(item)
+    return ", ".join(item for item in filtered if item)
 
 
 def _hex_rgb(value: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -2019,6 +2511,14 @@ def _render_cover_title(raw_path: Path, out_path: Path, title: str) -> Path:
     return out_path
 
 
+def _finalize_cover_image(raw_path: Path, out_path: Path, width: int, height: int) -> Path:
+    img = Image.open(raw_path).convert("RGB")
+    img = ImageOps.fit(img, (max(320, int(width)), max(180, int(height))), method=Image.LANCZOS, centering=(0.5, 0.5))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path, "JPEG", quality=93, optimize=True)
+    return out_path
+
+
 def _create_cover_placeholder(prompt: str, title: str, out_path: Path, width: int, height: int) -> Path:
     seed = int(_text_hash(f"{title}\n{prompt}")[:12], 16)
     palettes = [
@@ -2085,7 +2585,7 @@ def stage_cover(
     provider = cover_backend["provider"]
     expected_hash = _stable_hash(
         {
-            "schema": "cover_v1",
+            "schema": "cover_v2_prompt_generated_title",
             "title": title,
             "excerpt_hash": _text_hash(excerpt),
             "provider": provider,
@@ -2093,13 +2593,11 @@ def stage_cover(
             "model": cover_backend["model"],
             "style": config.llm_image_style_suffix,
             "prompt_template": config.get("cover_prompt_template", ""),
+            "custom_prompt": config.get("cover_custom_prompt", ""),
+            "analysis_prompt": config.get("cover_ai_analysis_prompt", ""),
             "width": int(config.get("cover_width", 1280) or 1280),
             "height": int(config.get("cover_height", 720) or 720),
-            "title_size": int(config.get("cover_title_size", 72) or 72),
-            "title_font": config.get("cover_title_font", ""),
-            "title_color": config.get("cover_title_color", ""),
-            "title_bg": config.get("cover_title_bg", ""),
-            "title_area_ratio": float(config.get("cover_title_area_ratio", 0.24) or 0.24),
+            "title_mode": "prompt_generated",
             "api_key_hash": _text_hash(cover_backend["api_key"])[:16],
         }
     )
@@ -2125,7 +2623,7 @@ def stage_cover(
         model=cover_backend["model"],
         steps=config.image_steps,
         cfg=config.image_cfg,
-        workflow_path=cover_backend.get("workflow_path", config.image_workflow),
+        workflow_path=cover_backend.get("workflow_path", ""),
         timeout_seconds=config.get("image_api_timeout_seconds", 300),
     )
     raw_tmp = raw_path.with_suffix(".tmp.png")
@@ -2135,7 +2633,7 @@ def stage_cover(
             _create_cover_placeholder(prompt, title, raw_tmp, width, height)
         else:
             with external_api_slot(action="cover image"):
-                backend.generate(prompt, config.llm_negative_prompt, raw_tmp, width=width, height=height)
+                backend.generate(prompt, _cover_negative_prompt(), raw_tmp, width=width, height=height)
         raw_tmp.replace(raw_path)
     except Exception as exc:
         raw_tmp.unlink(missing_ok=True)
@@ -2144,7 +2642,7 @@ def stage_cover(
             on_log("  WARN no generated image available for cover fallback; use placeholder")
             _create_cover_placeholder(prompt, title, raw_path, width, height)
 
-    _render_cover_title(raw_path, out_path, title)
+    _finalize_cover_image(raw_path, out_path, width, height)
     _write_json(
         manifest_path,
         {
@@ -2396,51 +2894,94 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
         "tags": str(config.youtube_tags or metadata.get("tags", "")),
         "job_id": job_dir.name,
     }
-    profile = _active_upload_profile()
-    title_template = str(profile.get("title_template") or config.youtube_title_template or "{clean_title}")
-    description_template = str(profile.get("description") or config.youtube_description or "")
-    flow = _normalize_upload_flow(profile.get("flow") or config.browser_flow or "simple")
-    visibility = str(profile.get("visibility") or config.youtube_visibility or "PRIVATE").strip().upper()
-    upload_policy = str(profile.get("upload_policy") or config.browser_upload_policy or "BTRA")
-    ad_interval = int(profile.get("ad_interval") or config.browser_ad_interval or 60)
-    ad_start = int(profile.get("ad_start") or config.browser_ad_start or 0)
-
-    upload_title = _limit_upload_title(
-        _format_template(title_template, context, fallback=clean_title),
-        int(config.get("youtube_title_max_chars", 100) or 100),
-    ) or clean_title
-    upload_description = _format_template(description_template, context, fallback="")
-    on_log(f"[7/7] YouTube browser upload: {upload_title}")
-    on_log(f"  upload profile={profile.get('name', '-') or '-'} flow={'精简' if flow == 'simple' else '完整'}")
+    profiles = _selected_upload_profiles()
+    if not profiles:
+        return ""
+    multi_upload = len(profiles) > 1
+    on_log(f"[7/7] YouTube browser upload: {len(profiles)} profile(s)")
     lock_path = _acquire_upload_lock(job_dir, on_log)
+    results: list[dict] = []
     try:
         _ensure_upload_dependencies(on_log)
         from app.upload import upload_to_youtube
 
-        video_id = upload_to_youtube(
-            video,
-            upload_title,
-            description=upload_description,
-            visibility=visibility,
-            cover_path=cover if cover and cover.exists() else None,
-            flow=flow,
-            upload_policy=upload_policy,
-            ad_interval=ad_interval,
-            ad_start=ad_start,
-            auto_restart=bool(config.browser_auto_restart),
-            stall_timeout_min=int(config.browser_stall_timeout_min or 10),
-            op_speed=str(config.browser_op_speed or "normal"),
-            on_log=on_log,
-            on_progress=lambda p: write_status(job_dir, stage="upload", upload_progress=float(p or 0)),
-        )
+        for index, profile in enumerate(profiles, start=1):
+            title_template = str(profile.get("title_template") or config.youtube_title_template or "{clean_title}")
+            description_template = str(profile.get("description") or config.youtube_description or "")
+            flow = _normalize_upload_flow(profile.get("flow") or config.browser_flow or "simple")
+            visibility = str(profile.get("visibility") or config.youtube_visibility or "PRIVATE").strip().upper()
+            upload_policy = str(profile.get("upload_policy") or config.browser_upload_policy or "BTRA")
+            ad_interval = _to_int(profile.get("ad_interval") or config.browser_ad_interval, 60)
+            ad_start = _to_int(profile.get("ad_start") or config.browser_ad_start, 0)
+            chrome_profile = str(profile.get("chrome_profile") or config.get("browser_chrome_profile", "Default") or "Default").strip() or "Default"
+            ad_suitability_template = str(
+                profile.get("ad_suitability_template") or config.get("browser_ad_suitability_template", "") or ""
+            )
+
+            upload_title = _limit_upload_title(
+                _format_template(title_template, context, fallback=clean_title),
+                int(config.get("youtube_title_max_chars", 100) or 100),
+            ) or clean_title
+            upload_description = _format_template(description_template, context, fallback="")
+            profile_name = str(profile.get("name") or f"上传方案{index}").strip() or f"上传方案{index}"
+            on_log(f"  [{index}/{len(profiles)}] profile={profile_name} chrome_profile={chrome_profile} flow={'精简' if flow == 'simple' else '完整'}")
+
+            def _profile_progress(progress, *, current=index, total=len(profiles)):
+                try:
+                    value = float(progress or 0)
+                except Exception:
+                    value = 0.0
+                if total > 1:
+                    value = ((current - 1) * 100.0 + max(0.0, min(100.0, value))) / total
+                write_status(job_dir, stage="upload", upload_progress=value)
+
+            video_id = upload_to_youtube(
+                video,
+                upload_title,
+                description=upload_description,
+                visibility=visibility,
+                cover_path=cover if cover and cover.exists() else None,
+                flow=flow,
+                upload_policy=upload_policy,
+                ad_interval=ad_interval,
+                ad_start=ad_start,
+                chrome_profile=chrome_profile,
+                ad_suitability_template=ad_suitability_template,
+                browser_profiles=str(config.get("browser_profiles", "[]") or "[]"),
+                browser_active_profile=profile_name,
+                upload_all_profiles=False,
+                force_profile_launch=multi_upload,
+                auto_restart=bool(config.browser_auto_restart),
+                stall_timeout_min=int(config.browser_stall_timeout_min or 10),
+                op_speed=str(config.browser_op_speed or "normal"),
+                on_log=on_log,
+                on_progress=_profile_progress,
+            )
+            if not video_id:
+                raise RuntimeError(f"YouTube upload failed: {profile_name}")
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            results.append(
+                {
+                    "profile": profile_name,
+                    "chrome_profile": chrome_profile,
+                    "video_id": video_id,
+                    "url": url,
+                    "title": upload_title,
+                    "description": upload_description,
+                    "visibility": visibility,
+                    "flow": flow,
+                }
+            )
+            _write_json(job_dir / "upload_result.json", {"uploads": results, **results[0]})
+            on_log(f"  OK uploaded [{profile_name}]: {url}")
     finally:
         _release_upload_lock(lock_path, job_dir.name)
-    if not video_id:
+    if not results:
         raise RuntimeError("YouTube upload failed")
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    _write_json(job_dir / "upload_result.json", {"video_id": video_id, "url": url, "title": upload_title, "description": upload_description})
-    on_log(f"  OK uploaded: {url}")
-    return url
+    _write_json(job_dir / "upload_result.json", {"uploads": results, **results[0]})
+    if len(results) > 1:
+        on_log(f"  OK uploaded {len(results)} copies")
+    return str(results[0].get("url") or "")
 
 
 def _upload_profiles() -> list[dict]:
@@ -2459,8 +3000,10 @@ def _upload_profiles() -> list[dict]:
             "ad_interval": 60,
             "ad_start": 0,
             "visibility": str(config.youtube_visibility or "PUBLIC"),
+            "chrome_profile": str(config.get("browser_chrome_profile", "Default") or "Default"),
             "title_template": "",
             "description": "",
+            "ad_suitability_template": str(config.get("browser_ad_suitability_template", "") or ""),
         },
         {
             "name": "完整创收流程",
@@ -2469,19 +3012,69 @@ def _upload_profiles() -> list[dict]:
             "ad_interval": int(config.browser_ad_interval or 60),
             "ad_start": int(config.browser_ad_start or 0),
             "visibility": str(config.youtube_visibility or "PUBLIC"),
+            "chrome_profile": str(config.get("browser_chrome_profile", "Default") or "Default"),
             "title_template": "",
             "description": "",
+            "ad_suitability_template": str(config.get("browser_ad_suitability_template", "") or ""),
         },
     ]
 
 
+def _to_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _bool_upload_profile_value(value, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"0", "false", "no", "off", "disabled", "关闭"}:
+        return False
+    if text in {"1", "true", "yes", "on", "enabled", "开启"}:
+        return True
+    return default
+
+
+def _normalize_upload_profile(profile: dict, index: int = 0) -> dict:
+    if not isinstance(profile, dict):
+        profile = {}
+    name = str(profile.get("name") or f"上传方案{index + 1}").strip() or f"上传方案{index + 1}"
+    return {
+        **profile,
+        "name": name,
+        "enabled": _bool_upload_profile_value(profile.get("enabled"), True),
+        "flow": _normalize_upload_flow(profile.get("flow") or config.browser_flow or "simple"),
+        "upload_policy": str(profile.get("upload_policy") or config.browser_upload_policy or "BTRA").strip() or "BTRA",
+        "ad_interval": _to_int(profile.get("ad_interval") or config.browser_ad_interval, 60),
+        "ad_start": _to_int(profile.get("ad_start") or config.browser_ad_start, 0),
+        "visibility": str(profile.get("visibility") or config.youtube_visibility or "PRIVATE").strip().upper() or "PRIVATE",
+        "chrome_profile": str(profile.get("chrome_profile") or config.get("browser_chrome_profile", "Default") or "Default").strip() or "Default",
+        "title_template": str(profile.get("title_template") or ""),
+        "description": str(profile.get("description") or ""),
+        "ad_suitability_template": str(profile.get("ad_suitability_template") or ""),
+    }
+
+
 def _active_upload_profile() -> dict:
-    profiles = _upload_profiles()
+    profiles = [_normalize_upload_profile(profile, idx) for idx, profile in enumerate(_upload_profiles())]
     active = str(config.get("browser_active_profile", "") or "").strip()
     for profile in profiles:
         if str(profile.get("name", "")).strip() == active:
             return dict(profile)
     return dict(profiles[0]) if profiles else {}
+
+
+def _selected_upload_profiles() -> list[dict]:
+    profiles = [_normalize_upload_profile(profile, idx) for idx, profile in enumerate(_upload_profiles())]
+    if bool(config.get("browser_upload_all_profiles", False)):
+        enabled = [dict(profile) for profile in profiles if profile.get("enabled", True)]
+        return enabled or [_active_upload_profile()]
+    return [_active_upload_profile()]
 
 
 def _normalize_upload_flow(value: str) -> str:
@@ -2586,8 +3179,9 @@ def run_full(
     job_dir.mkdir(parents=True, exist_ok=True)
 
     def log(message: str):
-        append_log(job_dir, message)
-        on_log(message)
+        safe_message = redact_secret_text(message)
+        append_log(job_dir, safe_message)
+        on_log(safe_message)
 
     def progress(stage: str, value: float, **extra):
         write_status(job_dir, job_id=job_id, stage=stage, progress=max(0.0, min(1.0, float(value))), **extra)
@@ -2772,28 +3366,51 @@ def run_full(
         start_next_queued_job(exclude_job_id=job_id, on_log=log)
         return result
     except Exception as exc:
-        log(f"ERROR 失败: {exc}\n{traceback.format_exc()}")
-        progress("failed", load_status(job_id).get("progress", 0), error=str(exc), worker_pid=None, finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        safe_exc = redact_secret_text(exc)
+        log(f"ERROR 失败: {safe_exc}\n{redact_secret_text(traceback.format_exc())}")
+        progress("failed", load_status(job_id).get("progress", 0), error=safe_exc, worker_pid=None, finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
         raise
 
 
 def _prompt_for_plan(llm: LLMBackend, plan: ImagePlan, on_log: LogFn, index: int) -> str:
-    if config.llm_api_key or config.llm_provider == "ollama":
+    prefix = str(config.get("llm_image_prompt_prefix", "") or "").strip()
+    context = {
+        "text": plan.text,
+        "excerpt": re.sub(r"\s+", " ", str(plan.text or "")).strip()[:500],
+        "index": index + 1,
+        "prefix": prefix,
+        "style": str(config.llm_image_style_suffix or "").strip(),
+        "theme_context": "",
+        "character_context": "",
+    }
+    request = _format_template(
+        str(config.get("llm_storyboard_user_template", "") or ""),
+        context,
+        fallback=plan.text,
+    )
+    if _can_call_text_llm():
         try:
             with external_api_slot(action=f"storyboard {index}"):
-                return _policy_safe_image_prompt(llm.storyboard(plan.text), fallback_text=plan.text)
+                return _policy_safe_image_prompt(_with_image_prefix(llm.storyboard(request)), fallback_text=plan.text)
         except Exception as exc:
             on_log(f"  WARN storyboard {index} LLM failed: {exc}; using safe template fallback")
     return _fallback_storyboard_prompt(plan.text)
 
 
+def _with_image_prefix(prompt: str) -> str:
+    prefix = re.sub(r"\s+", " ", str(config.get("llm_image_prompt_prefix", "") or "").strip())
+    value = re.sub(r"\s+", " ", str(prompt or "").strip())
+    if prefix and value and not value.lower().startswith(prefix[:80].lower()):
+        return f"{prefix} {value}"
+    return value or prefix
+
+
 def _fallback_storyboard_prompt(text: str) -> str:
     excerpt = re.sub(r"\s+", " ", str(text or "")).strip()
     excerpt = re.sub(r"[\"'`<>#]", " ", excerpt)[:120]
+    prefix = str(config.get("llm_image_prompt_prefix", "") or "").strip()
     prompt = (
-        "Cinematic anime illustration for a novel recap scene. "
-        "Show adult-looking characters in symbolic emotional drama, expressive faces, "
-        "clean composition, soft lighting, no readable text. "
+        f"{prefix} "
         f"Story mood reference: {excerpt}. {config.llm_image_style_suffix}"
     )
     return _policy_safe_image_prompt(prompt, fallback_text="")
@@ -2826,31 +3443,6 @@ def _copy_prefetched_images(paths: list[Path], prefetch_dir: Path, job_dir: Path
 def _estimated_speech_duration(text: str) -> float:
     compact = "".join(text.split())
     return max(1.2, min(45.0, len(compact) / 4.2))
-
-
-def _create_silence(out_path: Path, duration: float):
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with ffmpeg_slot(action="silent audio"):
-        subprocess.run(
-            [
-                ffmpeg_path(),
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "anullsrc=r=24000:cl=mono",
-                "-t",
-                f"{duration:.3f}",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "64k",
-                str(out_path),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
 
 
 def _write_json(path: Path, value):

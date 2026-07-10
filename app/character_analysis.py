@@ -228,7 +228,12 @@ def visual_theme_context(analysis: dict[str, Any] | None) -> str:
 def character_reference_prompt(character: dict[str, Any], analysis: dict[str, Any] | None = None) -> str:
     name = str(character.get("name") or "character").strip()
     trigger = str(character.get("trigger") or "").strip()
-    visual = str(character.get("reference_prompt_en") or character.get("visual_prompt_en") or character.get("visual_profile_zh") or "").strip()
+    visual = str(
+        character.get("reference_prompt_en")
+        or character.get("visual_prompt_en")
+        or character.get("visual_profile_zh")
+        or ""
+    ).strip()
     theme = visual_theme_context(analysis)
     theme = f"{theme}. " if theme else ""
     trigger_text = f"Use trigger token {trigger} for this character. " if trigger else ""

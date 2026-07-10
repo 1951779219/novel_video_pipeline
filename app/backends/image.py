@@ -8,6 +8,8 @@
   - placeholder (无任何后端时生成纯色占位图，方便先跑通流程)
   - custom     (自定义 OpenAI 兼容 /images/generations)
 """
+from __future__ import annotations
+
 import base64
 import io
 import json
@@ -20,6 +22,8 @@ from urllib.parse import urlencode, urlparse
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from app.utils.http import http_get, http_post
+from app.utils.secrets import clean_api_key, redact_secret_text
 
 
 def _openai_image_size(model: str, width: int, height: int) -> str:
@@ -33,9 +37,7 @@ def _openai_image_size(model: str, width: int, height: int) -> str:
 
 def _redact_http_detail(text: str, limit: int = 700) -> str:
     detail = " ".join(str(text or "").split())
-    detail = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1***", detail)
-    detail = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-***", detail)
-    detail = re.sub(r"(?i)(api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+", r"\1***", detail)
+    detail = redact_secret_text(detail)
     if len(detail) > limit:
         detail = detail[:limit].rstrip() + "..."
     return detail or "-"
@@ -73,7 +75,7 @@ class ImageBackend:
                  workflow_path: str = "", timeout_seconds: int | float = 300):
         self.provider = str(provider or "placeholder").lower()
         self.base_url = base_url.rstrip("/") if base_url else ""
-        self.api_key = api_key
+        self.api_key = clean_api_key(api_key)
         self.model = model
         self.steps = steps
         self.cfg = cfg
@@ -98,12 +100,7 @@ class ImageBackend:
         width: int = 1080,
         height: int = 1920,
     ) -> Path:
-        """Generate an image with optional reference images.
-
-        OpenAI-compatible providers use /images/edits. Providers without a
-        generic reference-image API fall back to text-to-image so one pipeline
-        can route all image jobs through the same abstraction safely.
-        """
+        """Generate an image with optional reference images."""
         refs = [Path(p) for p in reference_paths if p and Path(p).exists()]
         if refs and self.provider in {"openai", "custom"}:
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,7 +143,7 @@ class ImageBackend:
             "cfg_scale": self.cfg,
             "sampler_name": "DPM++ 2M Karras",
         }
-        r = httpx.post(url, json=payload, timeout=self.timeout_seconds)
+        r = http_post(url, json=payload, timeout=self.timeout_seconds)
         r.raise_for_status()
         data = r.json()
         b64 = data["images"][0]
@@ -169,7 +166,7 @@ class ImageBackend:
             "denoising_strength": 0.55,
             "sampler_name": "DPM++ 2M Karras",
         }
-        r = httpx.post(url, json=payload, timeout=self.timeout_seconds)
+        r = http_post(url, json=payload, timeout=self.timeout_seconds)
         r.raise_for_status()
         data = r.json()
         b64 = data["images"][0]
@@ -209,7 +206,7 @@ class ImageBackend:
             wf[neg_node]["inputs"]["text"] = negative
 
         client_id = str(uuid.uuid4())
-        r = httpx.post(f"{base}/prompt", json={"prompt": wf, "client_id": client_id}, timeout=min(120.0, self.timeout_seconds))
+        r = http_post(f"{base}/prompt", json={"prompt": wf, "client_id": client_id}, timeout=min(120.0, self.timeout_seconds))
         r.raise_for_status()
         prompt_id = r.json()["prompt_id"]
 
@@ -217,7 +214,7 @@ class ImageBackend:
         deadline = time.time() + self.timeout_seconds
         while time.time() < deadline:
             time.sleep(1.5)
-            h_resp = httpx.get(f"{base}/history/{prompt_id}", timeout=min(30.0, self.timeout_seconds))
+            h_resp = http_get(f"{base}/history/{prompt_id}", timeout=min(30.0, self.timeout_seconds))
             if h_resp.status_code != 200:
                 continue
             hist = h_resp.json()
@@ -233,7 +230,7 @@ class ImageBackend:
                         "subfolder": img_meta.get("subfolder", ""),
                         "type": img_meta.get("type", "output"),
                     })
-                    img_resp = httpx.get(f"{base}/view?{params}", timeout=min(120.0, self.timeout_seconds))
+                    img_resp = http_get(f"{base}/view?{params}", timeout=min(120.0, self.timeout_seconds))
                     img_resp.raise_for_status()
                     out_path.write_bytes(img_resp.content)
                     return
@@ -291,7 +288,7 @@ class ImageBackend:
 
     def _post_openai_image(self, url: str, headers: dict, payload: dict) -> Image.Image:
         try:
-            r = httpx.post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
+            r = http_post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
             r.raise_for_status()
         except httpx.HTTPStatusError as exc:
             # Older OpenAI-compatible relays often require response_format.
@@ -299,7 +296,7 @@ class ImageBackend:
             retry_payload = dict(payload)
             retry_payload["response_format"] = "b64_json"
             try:
-                r = httpx.post(url, json=retry_payload, headers=headers, timeout=self.timeout_seconds)
+                r = http_post(url, json=retry_payload, headers=headers, timeout=self.timeout_seconds)
                 r.raise_for_status()
             except httpx.HTTPStatusError as retry_exc:
                 retry_error = _http_error_detail(retry_exc)
@@ -312,7 +309,7 @@ class ImageBackend:
 
     def _post_openai_image_multipart(self, url: str, headers: dict, data: dict, files: list) -> Image.Image:
         try:
-            r = httpx.post(url, data=data, files=files, headers=headers, timeout=self.timeout_seconds)
+            r = http_post(url, data=data, files=files, headers=headers, timeout=self.timeout_seconds)
             r.raise_for_status()
         except httpx.HTTPStatusError as exc:
             first_error = _http_error_detail(exc)
@@ -329,7 +326,7 @@ class ImageBackend:
             return Image.open(io.BytesIO(base64.b64decode(str(b64_value))))
         url_value = row.get("url")
         if url_value:
-            img_bytes = httpx.get(url_value, timeout=min(120.0, self.timeout_seconds)).content
+            img_bytes = http_get(url_value, timeout=min(120.0, self.timeout_seconds)).content
             return Image.open(io.BytesIO(img_bytes))
         raise RuntimeError(f"OpenAI image response has no b64_json/url: {str(data)[:500]}")
 
@@ -344,14 +341,14 @@ class ImageBackend:
             "n": 1,
             "response_format": "b64_json",
         }
-        r = httpx.post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
+        r = http_post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
         r.raise_for_status()
         data = r.json()["data"][0]
         if "b64_json" in data:
             img_bytes = base64.b64decode(data["b64_json"])
             img = Image.open(io.BytesIO(img_bytes))
         else:
-            img_bytes = httpx.get(data["url"], timeout=min(120.0, self.timeout_seconds)).content
+            img_bytes = http_get(data["url"], timeout=min(120.0, self.timeout_seconds)).content
             img = Image.open(io.BytesIO(img_bytes))
         # Fit to the configured canvas without distorting the generated artwork.
         img = _fit_generated_image(img, w, h)
@@ -372,17 +369,17 @@ class ImageBackend:
                 "guidance_scale": self.cfg,
             },
         }
-        r = httpx.post(url, json=payload, headers=headers, timeout=min(120.0, self.timeout_seconds))
+        r = http_post(url, json=payload, headers=headers, timeout=min(120.0, self.timeout_seconds))
         r.raise_for_status()
         pid = r.json()["id"]
         deadline = time.time() + self.timeout_seconds
         while time.time() < deadline:
             time.sleep(2)
-            r2 = httpx.get(f"{url}/{pid}", headers=headers, timeout=20.0).json()
+            r2 = http_get(f"{url}/{pid}", headers=headers, timeout=20.0).json()
             if r2["status"] == "succeeded":
                 out = r2["output"]
                 img_url = out[0] if isinstance(out, list) else out
-                img_bytes = httpx.get(img_url, timeout=min(120.0, self.timeout_seconds)).content
+                img_bytes = http_get(img_url, timeout=min(120.0, self.timeout_seconds)).content
                 out_path.write_bytes(img_bytes)
                 return
             if r2["status"] in ("failed", "canceled"):
@@ -402,21 +399,21 @@ class ImageBackend:
             "input": {"prompt": prompt, "negative_prompt": negative},
             "parameters": {"size": f"{w}*{h}", "n": 1},
         }
-        r = httpx.post(url, json=payload, headers=headers, timeout=min(120.0, self.timeout_seconds))
+        r = http_post(url, json=payload, headers=headers, timeout=min(120.0, self.timeout_seconds))
         r.raise_for_status()
         task_id = r.json()["output"]["task_id"]
         # poll
         deadline = time.time() + self.timeout_seconds
         while time.time() < deadline:
             time.sleep(3)
-            q = httpx.get(
+            q = http_get(
                 f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}",
                 headers={"Authorization": f"Bearer {self.api_key}"}, timeout=20.0,
             ).json()
             status = q["output"]["task_status"]
             if status == "SUCCEEDED":
                 img_url = q["output"]["results"][0]["url"]
-                out_path.write_bytes(httpx.get(img_url, timeout=min(120.0, self.timeout_seconds)).content)
+                out_path.write_bytes(http_get(img_url, timeout=min(120.0, self.timeout_seconds)).content)
                 return
             if status in ("FAILED", "CANCELED"):
                 raise RuntimeError(f"阿里云出图失败: {q}")

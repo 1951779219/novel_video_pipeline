@@ -40,12 +40,12 @@ class UpdateTab:
         btns.pack(fill=tk.X, pady=(10, 0))
         self._check_btn = ttk.Button(btns, text="检查更新", command=self.check_update)
         self._check_btn.pack(side=tk.LEFT)
-        self._download_btn = ttk.Button(btns, text="下载并启动更新", command=self._download_update, state=tk.DISABLED)
+        self._download_btn = ttk.Button(btns, text="下载并应用更新", command=self._download_update, state=tk.DISABLED)
         self._download_btn.pack(side=tk.LEFT, padx=6)
 
         self._progress = ttk.Progressbar(box, maximum=100, mode="determinate")
         self._progress.pack(fill=tk.X, pady=(10, 0))
-        self._status = ttk.Label(box, text="发布新 tag 后，GitHub 会自动生成 latest.json 和更新包。", foreground="#555")
+        self._status = ttk.Label(box, text="从 GitHub Release 读取 latest.json；应用更新时会保留 data/settings.json、profiles、jobs 和浏览器登录态。", foreground="#555")
         self._status.pack(anchor=tk.W, pady=(6, 0))
 
         notes = ttk.LabelFrame(self.frame, text="发布说明", padding=8)
@@ -105,7 +105,7 @@ class UpdateTab:
         self._busy(False)
         self._progress["value"] = 100
         self._status.config(text=f"已下载: {zip_path.name}", foreground="green")
-        if not messagebox.askyesno("启动更新", "更新包已下载完成。现在启动更新程序并关闭软件？"):
+        if not messagebox.askyesno("应用更新", "更新包已下载完成。现在应用更新并关闭软件？\n\n用户配置、任务和浏览器登录态会保留。"):
             return
         try:
             from .updater import launch_update

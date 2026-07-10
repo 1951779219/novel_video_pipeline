@@ -1,4 +1,4 @@
-"""Resolve ffmpeg and ffprobe for portable Windows installs."""
+"""Resolve ffmpeg and ffprobe for portable Windows and macOS installs."""
 from __future__ import annotations
 
 import os
@@ -20,13 +20,23 @@ def _env_key(name: str) -> str:
 
 def _candidates(name: str) -> list[Path]:
     exe = _exe(name)
-    return [
+    candidates = [
         ROOT / "runtime" / "ffmpeg" / exe,
         ROOT / "tools" / "ffmpeg" / exe,
         ROOT / "tools" / "ffmpeg" / "bin" / exe,
         ROOT / "vendor" / "ffmpeg" / exe,
         LEGACY_DRAMA_FFMPEG / exe,
     ]
+    if os.name != "nt":
+        candidates.extend(
+            [
+                Path.home() / ".local" / "bin" / name,
+                Path("/opt/homebrew/bin") / name,
+                Path("/usr/local/bin") / name,
+                Path("/usr/bin") / name,
+            ]
+        )
+    return candidates
 
 
 def _resolve(name: str) -> str:
@@ -37,7 +47,7 @@ def _resolve(name: str) -> str:
     if found:
         return found
     for candidate in _candidates(name):
-        if candidate.exists():
+        if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
     return name
 
